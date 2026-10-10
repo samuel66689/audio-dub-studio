@@ -46,6 +46,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import uuid
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -565,7 +566,11 @@ _HUMAN_STYLE = (
     "Localize idioms, jokes and slang into natural Burmese equivalents \u2014 never translate "
     "them literally. No em-dashes, no explanatory padding. "
     "FINAL CHECK: read each line aloud in your head \u2014 if no real Burmese speaker would say "
-    "it like that, rewrite it until it sounds human."
+    "it like that, rewrite it until it sounds human. "
+    "TTS READABILITY: write every number as spoken Burmese words (TTS misreads bare digits); "
+    "strip [Music], (laughs) and all sound-effect / stage-direction tags \u2014 never read them aloud; "
+    "use ကျွန်တော် for a male speaker and ကျွန်မ for a female speaker; "
+    "keep each character's honorifics (ဦး/ဒေါ်/ကို/မ) consistent through the whole video."
 )
 
 _TRANSLATE_SYS = (
@@ -596,20 +601,42 @@ def _gemini_call(api_key, model_id, system_text, payload_text):
     import requests  # local import: requests မရှိရင် ဒီ step မှပဲ error တက်
     url = f"{GEMINI_BASE}{model_id}:generateContent"
     body = {
-        "contents": [{"role": "user", "parts": [
-            {"text": system_text}, {"text": payload_text}]}],
+        "systemInstruction": {"parts": [{"text": system_text}]},
+        "contents": [{"role": "user", "parts": [{"text": payload_text}]}],
         "generationConfig": {"responseMimeType": "application/json",
                              "temperature": 0.3, "maxOutputTokens": 8192},
     }
-    r = requests.post(url, headers={"Content-Type": "application/json",
-                                    "x-goog-api-key": api_key},
-                      json=body, timeout=120)
-    if r.status_code != 200:
-        raise RuntimeError(f"Gemini error {r.status_code}: {r.text[:300]}")
+    headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
+    last_err, retry_after = None, 0.0
+    for attempt in range(3):  # 429/5xx → exponential backoff နဲ့ ၃ ကြိမ်အထိ
+        try:
+            r = requests.post(url, headers=headers, json=body, timeout=120)
+        except Exception as e:
+            last_err = RuntimeError(f"Gemini request failed: {e}")
+            retry_after = 0.0
+        else:
+            if r.status_code == 200:
+                break
+            if r.status_code in (429, 500, 502, 503):
+                last_err = RuntimeError(f"Gemini error {r.status_code}: {r.text[:300]}")
+                try:
+                    retry_after = float(r.headers.get("Retry-After") or 0)
+                except (TypeError, ValueError):
+                    retry_after = 0.0
+            else:
+                raise RuntimeError(f"Gemini error {r.status_code}: {r.text[:300]}")
+        if attempt < 2:
+            time.sleep(max(4.0 * (2 ** attempt), retry_after))
+    else:
+        raise last_err
     data = r.json()
     try:
-        txt = data["candidates"][0]["content"]["parts"][0]["text"]
-    except (KeyError, IndexError):
+        parts = data["candidates"][0]["content"]["parts"]
+        txt = "".join(p.get("text", "") for p in parts
+                      if isinstance(p, dict) and isinstance(p.get("text"), str))
+    except (KeyError, IndexError, TypeError):
+        raise RuntimeError("Gemini က မျှော်လင့်မထားတဲ့ response ပြန်တယ်")
+    if not txt.strip():
         raise RuntimeError("Gemini က မျှော်လင့်မထားတဲ့ response ပြန်တယ်")
     txt = txt.strip()
     if txt.startswith("```"):
@@ -1102,14 +1129,19 @@ async def _edge_save(text, voice, path):
     await edge_tts.Communicate(text, voice).save(path)
 
 
+def _tts_cache_path(text, voice_primary):
+    """edge-tts cache file path — key = voice + text."""
+    key = hashlib.sha1(f"edge:{voice_primary}:{text}".encode("utf-8")).hexdigest()[:16]
+    return os.path.join(CACHE_TTS, f"{key}.mp3")
+
+
 def tts_segment(text, voice_primary=VOICE_MALE, voice_fallback=VOICE_FEMALE):
     """စာတစ်ကြောင်းကို TTS mp3 ထုတ် (cache ပါ). မရရင် None.
 
     မှတ်ချက်: ဒီစက်ရဲ့ network က Microsoft TTS ကို ပိတ်ထားလို့ ဒီမှာစမ်းရင်
     ပျက်မယ် — အဲ့တာ bug မဟုတ်ဘူး၊ user စက်မှာ အလုပ်လုပ်တယ်။
     """
-    key = hashlib.sha1(f"edge:{voice_primary}:{text}".encode("utf-8")).hexdigest()[:16]
-    out = os.path.join(CACHE_TTS, f"{key}.mp3")
+    out = _tts_cache_path(text, voice_primary)
     if _valid_audio(out):
         return out
     for voice in (voice_primary, voice_fallback):
@@ -1237,20 +1269,90 @@ def tts_natural(segments, voice, work_segs, progress_cb=None):
 
     fit_segment လို slot ထဲ အတင်းမထည့်ဘူး — TTS သဘာဝအရှည်အတိုင်း.
     Recap render အတွက် narration အရှည်တိုင်းဖို့ သုံးတယ်.
+    Cache လွတ်တဲ့အပိုင်းတွေကို asyncio.gather + Semaphore(6) နဲ့ ပြိုင်တူထုတ်တယ်.
     """
     os.makedirs(work_segs, exist_ok=True)
     out, failed = [], []
     n = len(segments)
-    for i, s in enumerate(segments):
-        text = s["text"].strip()
-        mp3 = tts_segment(text, voice, VOICE_FEMALE) if text else None
-        if mp3 is None:
-            failed.append((i, s["start"], text[:60]))
+    if n == 0:
+        return out, failed
+    texts = [(s.get("text") or "").strip() for s in segments]
+    mp3 = [None] * n
+    todo = []  # (i, text, path)
+    alias = {}  # စာသားထပ်နေတဲ့ index → ပထမဆုံး index (cache path တူ)
+    seen_path = {}
+    for i, text in enumerate(texts):
+        if not text:
+            continue
+        p = _tts_cache_path(text, voice)
+        if _valid_audio(p):
+            mp3[i] = p  # cache hit
+        elif p in seen_path:
+            alias[i] = seen_path[p]  # တစ်ပြိုင်နက် ဖိုင်တူရေးမိမှာစိုးလို့ alias ထား
         else:
-            out.append({"start": float(s["start"]), "end": float(s["end"]),
-                        "text": text, "mp3": mp3, "dur": dur(mp3)})
+            seen_path[p] = i
+            todo.append((i, text, p))
+
+    _done = [0]
+
+    def _tick(i):
+        _done[0] += 1
         if progress_cb:
-            progress_cb((i + 1) / n, i, text[:50])
+            progress_cb(_done[0] / n, i, texts[i][:50])
+
+    for i in range(n):  # cache-hit / စာလွတ် / စာသားထပ် တွေကို ချက်ချင်း တိုး
+        if mp3[i] is not None or not texts[i] or i in alias:
+            _tick(i)
+
+    async def _fetch(jobs, report):
+        sem = asyncio.Semaphore(6)
+
+        async def _one(i, text, v, path):
+            async with sem:
+                try:
+                    await _edge_save(text, v, path)
+                    ok = _valid_audio(path)
+                except Exception:
+                    ok = False
+                return i, ok
+
+        tasks = [asyncio.ensure_future(_one(i, t, v, p)) for i, t, v, p in jobs]
+        results = []
+        for fut in asyncio.as_completed(tasks):
+            i, ok = await fut
+            results.append((i, ok))
+            if report:
+                _tick(i)
+        return results
+
+    if todo:
+        by_i = {i: (text, path) for i, text, path in todo}
+        res1 = asyncio.run(_fetch(
+            [(i, t, voice, p) for i, (t, p) in by_i.items()], True))
+        need_retry = []
+        for i, ok in res1:
+            if ok:
+                mp3[i] = by_i[i][1]
+            else:
+                need_retry.append(i)
+        if need_retry:
+            # fallback voice နဲ့ တစ်ကြိမ်ထပ်ကြိုး (cache path က primary key အတိုင်း)
+            res2 = asyncio.run(_fetch(
+                [(i, by_i[i][0], VOICE_FEMALE, by_i[i][1]) for i in need_retry],
+                False))
+            for i, ok in res2:
+                if ok:
+                    mp3[i] = by_i[i][1]
+
+    for i, s in enumerate(segments):
+        if i in alias:  # စာသားထပ်နေတာ → ပထမအပိုင်းရဲ့ mp3 ကို ပြန်သုံး
+            mp3[i] = mp3[alias[i]]
+        if mp3[i] is None:
+            failed.append((i, s.get("start", 0.0), texts[i][:60]))
+        else:
+            out.append({"start": float(s.get("start", 0.0)),
+                        "end": float(s.get("end", 0.0)),
+                        "text": texts[i], "mp3": mp3[i], "dur": dur(mp3[i])})
     return out, failed
 
 
@@ -1399,6 +1501,16 @@ _SRT_TS_LINE = re.compile(
     r"(\d+:[\d:.,]+)\s*-->\s*(\d+:[\d:.,]+)")
 
 
+def _decode_text_upload(raw):
+    """Uploaded file bytes → str (utf-8-sig / utf-16 / cp1252 အစဉ်လိုက် စမ်း)."""
+    for enc in ("utf-8-sig", "utf-16", "cp1252"):
+        try:
+            return bytes(raw).decode(enc)
+        except (UnicodeDecodeError, ValueError):
+            continue
+    return ""
+
+
 def parse_srt(text):
     """SRT ဖိုင်စာသား → [{start, end, text}]. စာသားအပိုဒ်များရင် space နဲ့ဆက်."""
     text = text.replace("\ufeff", "").replace("\r\n", "\n").replace("\r", "\n")
@@ -1476,7 +1588,7 @@ def _foreign_script_name(text):
                 return name
     return "တခြား"
 # my-MM TTS ခန့်မှန်းအမြန်နှုန်း (စာလုံး/စက္ကန့်) — ပြဿနာလိုင်းရှာဖို့ ခန့်မှန်းချက်သက်သက်
-_EST_CPS = 14.0
+_EST_CPS = 12.0  # NARR_CPS (12.0) နဲ့ တစ်သမတ်တည်းဖြစ်အောင် unified
 
 
 def find_problem_lines(segments, max_speed):
@@ -1514,6 +1626,8 @@ def _qc_bad_reason(text):
         return "စာသားလွတ်နေတယ်"
     if _FOREIGN_SCRIPT_RE.search(t):
         return f"{_foreign_script_name(t)} စာလုံး ပါနေတယ်"
+    if re.search(r"[\u1000-\u109F]", t) and re.search(r"[A-Za-z]", t):
+        return "မြန်မာနဲ့ အင်္ဂလိပ် ရောနေတယ်"
     if not re.search(r"[\u1000-\u109F]", t) and re.search(r"[A-Za-z]{3,}", t):
         return "ဘာသာမပြန်ရသေးဘူး (မူရင်းအတိုင်း ကျန်နေတယ်)"
     return None
@@ -2409,6 +2523,43 @@ def main():
                 st.toast(f"✅ အသံထုတ်ပြီးပြီ — ဗီဒီယို {d:.1f} စက္ကန့်")
                 S["wizard_step"] = 2
                 st.rerun()
+            if S.video_path:
+                # 📄 ဗီဒီယိုမုဒ်မှာ SRT အဆင်သင့်ရှိရင် — transcribe (အဆင့် ၂) ကျော်နိုင်
+                with st.expander("📄 SRT အဆင်သင့်ရှိလား? (အဆင့် ၂ ကျော်မယ်)"):
+                    st.caption("ဒီဗီဒီယိုနဲ့ အချိန်ကိုက်တဲ့ SRT ရှိရင် တင်လိုက်ပါ — "
+                               "အသံနားထောင်ပြီး စာသားထုတ်စရာမလိုတော့ဘူး။")
+                    vsrt_up = st.file_uploader("SRT ဖိုင်ရွေးပါ", type=["srt"],
+                                               key="srt_up_video")
+                    vsrt_lang = st.radio(
+                        "SRT က ဘယ်ဘာသာစကားလဲ",
+                        ["🌐 ဘာသာခြား (ဘာသာပြန်မယ်)",
+                         "✅ မြန်မာလို အဆင်သင့် (တိုက်ရိုက်အသံထုတ်မယ်)"],
+                        horizontal=True, key="srt_lang_radio_video")
+                    v_is_my = vsrt_lang.startswith("✅")
+                    _bc1v, _ = st.columns([1, 2])
+                    with _bc1v:
+                        _gov = (st.button("▶️ SRT ထည့်ရန်", type="primary",
+                                          use_container_width=True)
+                                if vsrt_up is not None else False)
+                    if _gov:
+                        v_segs = parse_srt(_decode_text_upload(vsrt_up.getbuffer()))
+                        if not v_segs:
+                            st.error("SRT ထဲမှာ စာသားမတွေ့ဘူး — ဖိုင်စစ်ကြည့်ပါ")
+                            st.stop()
+                        S.update(src_segments=v_segs, lang="",
+                                 translations=None, final_segments=None,
+                                 fitted=None, fit_report=None,
+                                 out_mp4=None, out_mp3=None,
+                                 srt_name=vsrt_up.name, srt_is_my=v_is_my)
+                        if v_is_my:
+                            # မြန်မာလို အဆင်သင့်မို့ ဘာသာပြန်စရာမလို — အဆင့် ၄ တန်းသွား
+                            S.translations = [
+                                {"start": s["start"], "end": s["end"],
+                                 "text": s["text"], "src": ""} for s in v_segs]
+                        _reset_review_keys(S)
+                        st.toast(f"✅ SRT ထည့်ပြီးပြီ — အပိုင်း {len(v_segs)} ခု")
+                        S["wizard_step"] = 4 if v_is_my else 3
+                        st.rerun()
         else:
             srt_up = st.file_uploader("SRT ဖိုင်ရွေးပါ", type=["srt"], key="srt_up")
             srt_lang_choice = st.radio(
