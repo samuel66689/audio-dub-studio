@@ -1184,8 +1184,72 @@ def fit_segment(src_mp3, slot, gap_after, max_speed, out_path):
     return target, note, ratio
 
 
+def _parallel_tts_fetch(texts, voice_primary, voice_fallback, tick=None):
+    """texts[i] → mp3 path / None. cache-hit တွေကျော်, ကျန်တာ 6 ပြိုင်နက် edge-tts.
+
+    စာသားထပ်နေတာတွေ dedup (ဖိုင်တူကို ပြိုင်ရေးမိမှာစိုးလို့ တစ်ခါပဲထုတ်,
+    ကျန်တာက alias ပြန်ယူ). ရလဒ်အစဉ်က လိုင်းနံပါတ်အတိုင်း ပြန်စီထားတယ်.
+    network/loop ပြဿနာတက်ရင် exception တက် — caller က တကြောင်းချင်းနည်းနဲ့ fallback.
+    tick(i, done, total) → လိုင်းတစ်ကြောင်းပြီးတိုင်း (အစဉ်မလိုက်) ခေါ်.
+    """
+    n = len(texts)
+    paths = [None] * n
+    jobs, seen = [], {}
+    for i, t in enumerate(texts):
+        t = (t or "").strip()
+        if not t:
+            continue
+        cp = _tts_cache_path(t, voice_primary)
+        if _valid_audio(cp):
+            paths[i] = cp
+        elif cp in seen:
+            paths[i] = ("alias", seen[cp])
+        else:
+            seen[cp] = i
+            jobs.append((i, t, cp))
+
+    async def _run():
+        sem = asyncio.Semaphore(6)
+        out = {}
+        done = [0]
+
+        async def _one(i, text, path):
+            async with sem:
+                got = None
+                for v in (voice_primary, voice_fallback):
+                    try:
+                        await _edge_save(text, v, path)
+                        if _valid_audio(path):
+                            got = path
+                            break
+                    except Exception:
+                        continue
+                return i, got
+
+        tasks = [asyncio.ensure_future(_one(i, t, cp)) for i, t, cp in jobs]
+        for fut in asyncio.as_completed(tasks):
+            i, got = await fut
+            out[i] = got
+            done[0] += 1
+            if tick:
+                tick(i, done[0], len(jobs))
+        return out
+
+    if jobs:
+        for i, got in asyncio.run(_run()).items():
+            paths[i] = got
+    for i in range(n):
+        if isinstance(paths[i], tuple):
+            paths[i] = paths[paths[i][1]]
+    return paths
+
+
 def tts_and_fit(segments, voice, max_speed, work_segs, progress_cb=None, tts_fn=None):
     """segments: [{'start','end','text'}] → fitted mp3 တွေ.
+
+    အသံထုတ်တဲ့ (network) အပိုင်းကို 6 ပြိုင်နက်ထုတ် → ပြီးမှ တကြောင်းချင်း
+    duration တိုင်း + slot ထဲချိန် (အရင်အတိုင်း — sync logic လုံးဝမထိဘူး).
+    parallel ပျက်ရင် တကြောင်းချင်းနည်းနဲ့ အလိုအလျောက်ပြန်လုပ်.
 
     Returns: (fitted=[(start, seg_path, played)], report={natural, sped,
              overflow:[...], tts_failed:[...]})
@@ -1194,12 +1258,28 @@ def tts_and_fit(segments, voice, max_speed, work_segs, progress_cb=None, tts_fn=
     os.makedirs(work_segs, exist_ok=True)
     fitted, report = [], {"natural": 0, "sped": 0, "overflow": [], "tts_failed": []}
     n = len(segments)
+    texts = [(s["text"] or "").strip() for s in segments]
+
+    src_list = None
+    if tts_fn is tts_segment and n > 0:
+        try:
+            def _tick(i, done, total):
+                if progress_cb:
+                    progress_cb(0.7 * done / max(1, total), i, texts[i][:50])
+
+            src_list = _parallel_tts_fetch(texts, voice, VOICE_FEMALE, tick=_tick)
+        except Exception:
+            src_list = None  # fallback → အောက်က တကြောင်းချင်းနည်း
+
     for i, s in enumerate(segments):
-        start, end, text = s["start"], s["end"], s["text"].strip()
+        start, end, text = s["start"], s["end"], texts[i]
         slot = end - start
         next_start = segments[i + 1]["start"] if i + 1 < n else end
         gap_after = max(0.0, next_start - end)
-        src = tts_fn(text, voice, VOICE_FEMALE) if tts_fn is tts_segment else tts_fn(text)
+        if src_list is not None:
+            src = src_list[i]
+        else:
+            src = tts_fn(text, voice, VOICE_FEMALE) if tts_fn is tts_segment else tts_fn(text)
         if src is None:
             report["tts_failed"].append((i, start, text[:60]))
         else:
@@ -1213,7 +1293,8 @@ def tts_and_fit(segments, voice, max_speed, work_segs, progress_cb=None, tts_fn=
             else:
                 report["sped"] += 1
         if progress_cb:
-            progress_cb((i + 1) / n, i, text[:50])
+            base = 0.7 if src_list is not None else 0.0
+            progress_cb(base + (1.0 - base) * (i + 1) / n, i, text[:50])
     return fitted, report
 
 
@@ -1537,12 +1618,12 @@ def parse_srt(text):
 
 
 _REVIEW_LINE = re.compile(
-    r"(\d+:\d+:[\d.,]+)\s*-->\s*(\d+:[\d:.,]+)\s*\|\s*(.*)")
+    r"(?:\d+\.\s*)?(\d+:\d+:[\d.,]+)\s*-->\s*(\d+:[\d:.,]+)\s*\|\s*(.*)")
 
 
 def segments_to_review_text(segments):
-    return "\n".join(f"{fmt_ts(s['start'])} --> {fmt_ts(s['end'])} | {s['text']}"
-                     for s in segments)
+    return "\n".join(f"{i + 1}. {fmt_ts(s['start'])} --> {fmt_ts(s['end'])} | {s['text']}"
+                     for i, s in enumerate(segments))
 
 
 def parse_review_text(raw):
@@ -1556,8 +1637,10 @@ def parse_review_text(raw):
         if not m:
             raise ValueError(f"လိုင်း {ln} ပုံစံမှားနေတယ်: {line[:60]}")
         start, end, text = parse_ts(m.group(1)), parse_ts(m.group(2)), m.group(3).strip()
-        if end <= start or not text:
-            raise ValueError(f"လိုင်း {ln} အချိန်/စာသား မှားနေတယ်")
+        if not text:
+            raise ValueError(f"လိုင်း {ln} ({fmt_ts(start)} → {fmt_ts(end)}) စာသားလွတ်နေတယ်")
+        if end <= start:
+            raise ValueError(f"လိုင်း {ln} ({fmt_ts(start)} → {fmt_ts(end)}) အချိန်မှားနေတယ်")
         segs.append({"start": start, "end": end, "text": text})
     segs.sort(key=lambda x: x["start"])
     if not segs:
@@ -2850,11 +2933,12 @@ def main():
                 _work = S.translations
                 _parse_ok = False
             _flags = find_problem_lines(_work, max_speed)
-            # ရှည်တဲ့စာတွေ မပြ — တခြားဘာသာစကား/script ညှပ်ပါလာတာပဲ ပြ
-            _flags = [(i, r) for (i, r) in _flags if "စာလုံး ပါနေတယ်" in r]
+            # ရှည်တဲ့စာတွေ မပြ — တခြားဘာသာစကား/script + စာသားလွတ်နေတာပဲ ပြ
+            _flags = [(i, r) for (i, r) in _flags
+                      if "စာလုံး ပါနေတယ်" in r or "စာသားလွတ်နေတယ်" in r]
             if _flags:
                 with st.expander(
-                        f"🔍 တခြားဘာသာစကား ပါနေတဲ့လိုင်းများ ({len(_flags)})",
+                        f"🔍 ပြင်စရာလိုင်းများ ({len(_flags)})",
                         expanded=False):
                     st.caption("တစ်ခုချင်းနှိပ်ပြင်ရုံနဲ့ အောက်ကစာထဲ သူ့အလိုလို ဝင်သွားမယ်")
                     if not _parse_ok:
