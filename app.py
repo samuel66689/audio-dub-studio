@@ -1881,6 +1881,102 @@ def _auto_adopt_run(S, run_id):
         S["drama_name"] = s2["drama_name"]
 
 
+# ---------------- Manual wizard: refresh-proof checkpoints ----------------
+# Auto လို အဆင့်တိုင်း disk မှာ သိမ်း → refresh / tab ပိတ်-ပြန်ဖွင့်ရင် ပြန်ဆက်လို့ရ.
+# (redeploy တိုင်းတော့ disk အသစ်ဖြစ်လို့ မရ — Streamlit free hosting ကန့်သတ်ချက်.)
+
+def _manual_ckpt_save(S, is_video):
+    """Manual wizard state snapshot → ckpt/manual.json (JSON-safe only)."""
+    rid = S.get("run_id")
+    if not rid:
+        return
+    fitted = S.get("fitted")
+    fr = S.get("fit_report") or {}
+    _ckpt_save(rid, "manual", {
+        "mode": "manual",
+        "is_video": bool(is_video),
+        "src_mode": S.get("src_mode"),
+        "run_id": rid,
+        "video_path": S.get("video_path"),
+        "audio_path": S.get("audio_path"),
+        "duration": S.get("duration"),
+        "dl_base": S.get("dl_base"),
+        "srt_name": S.get("srt_name"),
+        "srt_is_my": S.get("srt_is_my"),
+        "lang": S.get("lang"),
+        "src_segments": S.get("src_segments"),
+        "translations": S.get("translations"),
+        "name_lock": S.get("name_lock"),
+        "final_segments": S.get("final_segments"),
+        "fitted": [list(x) for x in fitted] if fitted else None,
+        "fit_report": {
+            "natural": fr.get("natural", 0), "sped": fr.get("sped", 0),
+            "overflow": [list(x) for x in (fr.get("overflow") or [])],
+            "tts_failed": [list(x) for x in (fr.get("tts_failed") or [])],
+        } if fr else None,
+        "wizard_step": S.get("wizard_step", 1),
+        "mtime": time.time(),
+    })
+
+
+def _find_latest_manual_run(max_age_days=7):
+    """မပြီးသေးတဲ့ manual run အသစ်ဆုံး (refresh resume အတွက်)."""
+    if not os.path.isdir(WORK_DIR):
+        return None
+    best, best_mt, now = None, 0.0, time.time()
+    try:
+        rids = os.listdir(WORK_DIR)
+    except OSError:
+        return None
+    for rid in rids:
+        mp = _ckpt_path(rid, "manual")
+        if not os.path.isfile(mp) or os.path.isfile(_ckpt_path(rid, "done")):
+            continue
+        try:
+            mt = os.path.getmtime(mp)
+        except OSError:
+            continue
+        if now - mt > max_age_days * 86400:
+            continue
+        if mt > best_mt:
+            best, best_mt = rid, mt
+    return best
+
+
+def _manual_adopt_run(S, run_id):
+    """Checkpoint → session state ပြန်ထည့်. True = အောင်မြင်."""
+    d = _ckpt_load(run_id, "manual") or {}
+    if not d:
+        return False
+    if d.get("is_video"):
+        vp = d.get("video_path")
+        if not vp or not os.path.isfile(vp):
+            return False
+    fr = d.get("fit_report") or {}
+    fitted = d.get("fitted")
+    S.update(
+        run_id=d.get("run_id"), video_path=d.get("video_path"),
+        audio_path=d.get("audio_path"), duration=d.get("duration"),
+        dl_base=d.get("dl_base"), srt_name=d.get("srt_name"),
+        srt_is_my=d.get("srt_is_my"), lang=d.get("lang"),
+        src_segments=d.get("src_segments"), translations=d.get("translations"),
+        name_lock=d.get("name_lock"), final_segments=d.get("final_segments"),
+        fitted=[tuple(x) for x in fitted] if fitted else None,
+        fit_report={
+            "natural": fr.get("natural", 0), "sped": fr.get("sped", 0),
+            "overflow": [tuple(x) for x in (fr.get("overflow") or [])],
+            "tts_failed": [tuple(x) for x in (fr.get("tts_failed") or [])],
+        } if fr else None,
+        out_mp4=None, out_mp3=None,
+    )
+    if d.get("src_mode"):
+        S["src_mode"] = d["src_mode"]
+        S["_mode"] = d["src_mode"]
+    S["wizard_step"] = d.get("wizard_step", 1)
+    _reset_review_keys(S)
+    return True
+
+
 def _qc_report_json(qc):
     """qc report ကို JSON-serializable ဖြစ် (still_bad tuple → list)."""
     qc = dict(qc or {})
@@ -2608,6 +2704,27 @@ def main():
     S["_mode"] = mode
     is_video = (mode == "🎬 ဗီဒီယို")
 
+    # 🔄 refresh resume: အရင်လုပ်လက်စ manual run ရှိရင် ပြန်ဆက်ခိုင်း
+    # (ဖိုင်ပြန်တင်စရာ မလို — disk ပေါ်က checkpoint ကနေ ပြန်ယူမယ်)
+    if not S.get("video_path") and not S.get("src_segments"):
+        _resume_rid = _find_latest_manual_run()
+        if _resume_rid:
+            _rm = _ckpt_load(_resume_rid, "manual") or {}
+            _rname = os.path.basename(_rm.get("video_path") or "") or _rm.get("srt_name") or "?"
+            _rstep = _rm.get("wizard_step", 1)
+            _rc1, _rc2 = st.columns([3, 1])
+            with _rc1:
+                st.info(f"🔄 အရင်လုပ်လက်စ တွေ့တယ် — 📁 {_rname} (အဆင့် {_rstep}/6)")
+            with _rc2:
+                if st.button("▶️ ပြန်ဆက်မယ်", type="primary",
+                             use_container_width=True, key="manual_resume_btn"):
+                    if _manual_adopt_run(S, _resume_rid):
+                        st.toast("✅ အရင်လုပ်လက်စ ပြန်ရပြီ")
+                        st.rerun()
+                    else:
+                        st.error("ဖိုင်မရှိတော့ဘူး (server ပြန်စထားလို့ ဖြစ်နိုင်တယ်) — "
+                                 "အသစ်ပြန်စပါ")
+
     # 🎙️ narrator UI ဝှက်ထားတယ် (code ကျန်တယ်) — အခု စာကြောင်းချင်းပြန်ပဲ
     narr = False
     if str(S.get("_narr_mode", "")).startswith("🎙️"):
@@ -2650,6 +2767,7 @@ def main():
                          dl_base=os.path.splitext(up.name)[0])
                 st.toast(f"✅ အသံထုတ်ပြီးပြီ — ဗီဒီယို {d:.1f} စက္ကန့်")
                 S["wizard_step"] = 2
+                _manual_ckpt_save(S, is_video)
                 st.rerun()
             if S.video_path:
                 # 📄 ဗီဒီယိုမုဒ်မှာ SRT အဆင်သင့်ရှိရင် — transcribe (အဆင့် ၂) ကျော်နိုင်
@@ -2687,6 +2805,7 @@ def main():
                         _reset_review_keys(S)
                         st.toast(f"✅ SRT ထည့်ပြီးပြီ — အပိုင်း {len(v_segs)} ခု")
                         S["wizard_step"] = 4 if v_is_my else 3
+                        _manual_ckpt_save(S, is_video)
                         st.rerun()
         else:
             srt_up = st.file_uploader("SRT ဖိုင်ရွေးပါ", type=["srt"], key="srt_up")
@@ -2732,6 +2851,7 @@ def main():
                 _reset_review_keys(S)
                 st.toast(f"✅ SRT ဖတ်ပြီးပြီ — အပိုင်း {len(segs)} ခု")
                 S["wizard_step"] = 4 if is_my else 3
+                _manual_ckpt_save(S, is_video)
                 st.rerun()
         _spidey_card_close()
 
@@ -2791,6 +2911,7 @@ def main():
                 st.toast(f"✅ အပိုင်း {len(segs)} ခု တွေ့တယ် ({_via}){merge_note}"
                          + (f" (ဘာသာစကား: {S.lang})" if S.lang else ""))
                 S["wizard_step"] = 3
+                _manual_ckpt_save(S, is_video)
                 st.rerun()
             if S.src_segments:
                 with st.expander(f"တွေ့တဲ့အပိုင်း {len(S.src_segments)} ခု ကြည့်"):
@@ -3008,6 +3129,7 @@ def main():
                         st.warning(f"⚠️ {len(failed)} ပိုင်း ပြန်မရလို့ မူရင်းစာသားအတိုင်း ထားထားတယ်")
                     st.toast(f"✅ {len(result)} ပိုင်း ဘာသာပြန်ပြီးပြီ")
                     S["wizard_step"] = 4
+                    _manual_ckpt_save(S, is_video)
                     st.rerun()
                 if S.translations:
                     with st.expander("ဘာသာပြန်ချက် ကြည့်"):
@@ -3093,6 +3215,7 @@ def main():
                             save_story_memory(_drama_name_m4, _mem4)
                     st.toast(f"✅ {len(S.final_segments)} ပိုင်း အတည်ပြုပြီးပြီ")
                     S["wizard_step"] = 5
+                    _manual_ckpt_save(S, is_video)
                     st.rerun()
                 except ValueError as e:
                     st.error(str(e))
@@ -3149,6 +3272,7 @@ def main():
                 prog.empty(); curlbl.empty()
                 st.toast(f"✅ အပိုင်း {len(fitted)} ပိုင်း အသံထွက်ပြီးပြီ")
                 S["wizard_step"] = 6
+                _manual_ckpt_save(S, is_video)
                 st.rerun()
         _spidey_card_close()
 
@@ -3216,6 +3340,7 @@ def main():
                             shutil.copyfile(_stage, out)
                         S.out_subs = _subs
                     S.out_mp4 = out
+                    _ckpt_save(S.run_id, "done", {"ok": True, "mtime": time.time()})
                     st.success("✅ ပြီးပြီ! အောက်မှာ download ချလို့ရပြီ")
             else:
                 _bc6s, _ = st.columns([1, 2])
@@ -3228,6 +3353,7 @@ def main():
                     with st.status("အသံဆက်နေတယ်...", expanded=False):
                         assemble_dubbed(S.fitted, S.duration, work_asm, out)
                     S.out_mp3 = out
+                    _ckpt_save(S.run_id, "done", {"ok": True, "mtime": time.time()})
                     st.success("✅ ပြီးပြီ! အောက်မှာ download ချလို့ရပြီ")
             _has_out = ((S.out_mp4 and os.path.isfile(S.out_mp4)) or
                         (S.out_mp3 and os.path.isfile(S.out_mp3)))
