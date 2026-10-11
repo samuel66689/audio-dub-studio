@@ -367,8 +367,9 @@ def _transcribe_single(audio_path, api_key, language=None):
 def _transcribe_chunked(audio_path, api_key, language=None, on_chunk=None):
     """အသံရှည် (>20MB) ကို ~12MB အပိုင်းတွေ ခွဲ → တစ်ခုချင်း Groq → timestamp ပြန်ဆက်.
 
-    sub-translator ရဲ့ _transcribe_chunked ပုံစံ (port) + အပိုင်းဆက်နေရာ
-    (+1s overlap) မှာ စာသားထပ်နေတာ ဖယ်တယ်။
+    sub-translator ရဲ့ _transcribe_chunked စည်းမျဉ်း (port):
+    အပိုင်းဆက်နေရာ (+1s overlap) ကို အချိန်နဲ့ကျော် (နောက်အပိုင်းရဲ့ ပထမ 0.9s)
+    + စာသားအတူတူအထပ် အပိုဖယ်။
     """
     total = dur(audio_path) or 0
     CHUNK_SEC = 3000.0  # 32kbps mono → ~12MB/ခု (Groq 25MB အောက် safe)
@@ -394,9 +395,15 @@ def _transcribe_chunked(audio_path, api_key, language=None, on_chunk=None):
             s = dict(s)
             s["start"] = float(s.get("start") or 0) + start
             s["end"] = float(s.get("end") or 0) + start
+            # chunk တွေက ၁ စက္ကန့်စီ ထပ်နေလို့ (-t step+1) —
+            # နောက်အပိုင်းက အရင်အပိုင်းရပြီးသားနေရာကို အချိန်နဲ့ကျော်ပစ်
+            # (0.9 = Whisper timestamp တိမ်းယိမ်းမှုအတွက် အနားသတ်;
+            #  sub-translator ရဲ့ စည်းမျဉ်းအတိုင်း — စာသားကွဲရေးမိရင်တောင် မိတယ်)
+            if i > 0 and s["start"] < start + 0.9:
+                continue
             all_segs.append(s)
     all_segs.sort(key=lambda s: s["start"])
-    # overlap ကြောင့် အပိုင်းဆက်မှာ စာသားအတူတူ ထပ်ပါတာ ဖယ်
+    # အပိုလုံခြုံရေး: 0.9–1.0s ကြားကျန်နိုင်တဲ့ စာသားအတူတူအထပ်ကို ဖယ်
     deduped = []
     for s in all_segs:
         if (deduped and abs(s["start"] - deduped[-1]["start"]) < 0.5
