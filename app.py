@@ -728,6 +728,46 @@ def gemini_translate(api_key, segments, model_id, progress_cb=None, glossary=Non
     return result, failed
 
 
+_TIKTOK_SYS = (
+    "You are a TikTok content assistant for a Burmese-dubbed Chinese drama channel. "
+    "The user will paste your image prompt into an AI image app (Flow) to make a 9:16 poster, "
+    "and post the caption on TikTok. "
+    "Respond with STRICT JSON only: {\"caption\": str, \"hashtags\": [str], "
+    "\"poster_title\": str, \"poster_sub\": str, \"poster_prompt\": str}. "
+    "Rules: "
+    "caption = ONE punchy Burmese hook line (under 60 chars) that stops scrollers, no hashtags inside. "
+    "hashtags = 8-12 TikTok hashtags WITH the # symbol, the kind Myanmar movie-recap creators "
+    "actually use (mix broad and niche drama/recap tags). "
+    "poster_title = short Burmese poster title (under 25 chars), dramatic. "
+    "poster_sub = Burmese sub-line like 'episode {N} + short hook' using the filename hint for N. "
+    "poster_prompt = English image prompt for a 9:16 vertical cinematic movie poster of the single "
+    "most dramatic or emotional moment in these lines. Photorealistic, dramatic lighting, no watermark. "
+    "It MUST instruct the image model to render this EXACT Burmese text: the poster_title as a large "
+    "bold white title with black outline across the top, and the poster_sub as a smaller bold yellow "
+    "sub-line directly beneath it. No other text in the image. "
+    "If the model cannot render Burmese script cleanly, it must leave the top third empty instead.")
+
+
+def _tiktok_pack(api_key, model_id, segments, dl_base):
+    """Dub ပြီးသားလိုင်းတွေ → TikTok caption + hashtag + Flow poster prompt (JSON dict)."""
+    lines = [f"{i + 1}. {s['text']}" for i, s in enumerate(segments[:150])]
+    payload = ("filename_hint: " + (dl_base or "") + "\n"
+               "dubbed_lines:\n" + "\n".join(lines))
+    data = _gemini_call(api_key, model_id, _TIKTOK_SYS, payload)
+    if not isinstance(data, dict):
+        raise RuntimeError("TikTok pack format မမှန်ပါ")
+    tags = data.get("hashtags") or []
+    if isinstance(tags, str):
+        tags = [tags]
+    return {
+        "caption": str(data.get("caption") or "").strip(),
+        "hashtags": [str(t).strip() for t in tags if str(t).strip()][:14],
+        "poster_title": str(data.get("poster_title") or "").strip(),
+        "poster_sub": str(data.get("poster_sub") or "").strip(),
+        "poster_prompt": str(data.get("poster_prompt") or "").strip(),
+    }
+
+
 def merge_tiny_segments(segments, max_gap=0.5, min_slot=1.5, max_merged=8.0):
     """Whisper (verbose_json) က တခါတလေ စက္ကန့်ပိုင်းအကွက်သေးသေးလေးတွေ
     (ဥပမာ 0.2s) ပေးတတ်တယ် — အဲ့ဒါတွေကို ကပ်နေတဲ့နောက်အပိုင်းနဲ့ ပေါင်းလိုက်.
@@ -1908,6 +1948,7 @@ def _manual_ckpt_save(S, is_video):
         "translations": S.get("translations"),
         "name_lock": S.get("name_lock"),
         "final_segments": S.get("final_segments"),
+        "tiktok_pack": S.get("tiktok_pack"),
         "fitted": [list(x) for x in fitted] if fitted else None,
         "fit_report": {
             "natural": fr.get("natural", 0), "sped": fr.get("sped", 0),
@@ -1961,6 +2002,7 @@ def _manual_adopt_run(S, run_id):
         srt_is_my=d.get("srt_is_my"), lang=d.get("lang"),
         src_segments=d.get("src_segments"), translations=d.get("translations"),
         name_lock=d.get("name_lock"), final_segments=d.get("final_segments"),
+        tiktok_pack=d.get("tiktok_pack"),
         fitted=[tuple(x) for x in fitted] if fitted else None,
         fit_report={
             "natural": fr.get("natural", 0), "sped": fr.get("sped", 0),
@@ -3398,6 +3440,41 @@ def main():
                     st.download_button("⬇️ SRT", segments_to_srt(_srt_segs),
                                        file_name=f"{_dl}.srt", mime="text/plain",
                                        use_container_width=True)
+            # ---- 📱 TikTok ထုတ်ရန်: caption + hashtag + Flow poster prompt
+            # (Gemini စာနဲ့ပဲ ထုတ်တာ — အခမဲ့; ပုံကို Flow ထဲမှာ ကိုယ်တိုင်ထုတ်)
+            if S.final_segments:
+                st.markdown("---")
+                st.markdown("### 📱 TikTok ထုတ်ရန်")
+                st.caption("Caption + hashtag + Flow AI poster prompt — "
+                           "dub ပြီးသားစာသားတွေကို ဖတ်ပြီး ထုတ်ပေးမယ်")
+                if st.button("✨ Caption + Prompt ထုတ်ရန်", type="primary",
+                             use_container_width=True, key="tiktok_gen_btn"):
+                    if not api_key:
+                        st.warning("⚠️ Gemini API key လိုတယ် (ဘယ်ဘက် sidebar)")
+                    else:
+                        with st.spinner("TikTok pack ထုတ်နေတယ်..."):
+                            try:
+                                S.tiktok_pack = _tiktok_pack(
+                                    api_key, model_id.strip() or GEMINI_MODEL_DEFAULT,
+                                    S.final_segments, S.get("dl_base"))
+                                S["_tt_gen"] = S.get("_tt_gen", 0) + 1
+                                _manual_ckpt_save(S, is_video)
+                            except Exception as e:
+                                st.error(f"ထုတ်တာ ပျက်သွားတယ်: {e}")
+                _tp = S.get("tiktok_pack")
+                if _tp:
+                    _tg = S.get("_tt_gen", 0)
+                    st.text_area("📝 Caption (ထိထိမိမိ တစ်ကြောင်း)",
+                                 _tp.get("caption", ""), key=f"tt_caption_{_tg}")
+                    st.text_area("#️⃣ Hashtags",
+                                 " ".join(_tp.get("hashtags", "") or []),
+                                 key=f"tt_tags_{_tg}")
+                    _pt, _ps = _tp.get("poster_title", ""), _tp.get("poster_sub", "")
+                    if _pt or _ps:
+                        st.caption(f"🖼️ ပုံထဲစာ: {_pt}" + (f" / {_ps}" if _ps else ""))
+                    st.text_area("🎨 Poster Prompt (Flow AI ထဲ paste)",
+                                 _tp.get("poster_prompt", ""), height=180,
+                                 key=f"tt_prompt_{_tg}")
         _spidey_card_close()
     # ---- wizard အောက် nav: စာအပေါ်, ခလုတ် ၂ ခု ဘေးချင်းကပ်
     _cur = max(1, min(6, int(S.get("wizard_step", 1))))
