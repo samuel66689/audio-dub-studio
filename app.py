@@ -2686,26 +2686,10 @@ def main():
             unsafe_allow_html=True)
         return
 
-    mode = st.radio("အရင်းအမြစ်", ["🎬 ဗီဒီယို", "📄 SRT ဖိုင်"], horizontal=True,
-                    key="src_mode",
-                    help="ဗီဒီယိုတင်ပြီး အစအဆုံးလုပ်မလား၊ "
-                         "SRT ဖိုင်အဆင်သင့်ရှိလို့ အဲ့ဒါကနေပဲ ဆက်လုပ်မလား")
-    if S.get("_mode") is not None and S["_mode"] != mode:
-        for k in ("run_id", "video_path", "audio_path", "duration",
-                  "src_segments", "translations", "final_segments",
-                  "fitted", "fit_report", "out_mp4", "out_mp3", "lang",
-                  "auto_shortened", "srt_name", "srt_is_my", "dl_base",
-                  "dl_name", "_dl_for", "scenes", "scene_descs"):
-            if k in S:
-                del S[k]
-        _reset_review_keys(S)
-        S["_mode"] = mode
-        st.rerun()
-    S["_mode"] = mode
-    is_video = (mode == "🎬 ဗီဒီယို")
-
     # 🔄 refresh resume: အရင်လုပ်လက်စ manual run ရှိရင် ပြန်ဆက်ခိုင်း
     # (ဖိုင်ပြန်တင်စရာ မလို — disk ပေါ်က checkpoint ကနေ ပြန်ယူမယ်)
+    # NOTE: radio widget မပေါ်ခင် ဒီမှာ ထားရမယ် — adopt က S["src_mode"] ကို
+    # widget instantiate မလုပ်ခင် set ရမှာ (ပြီးမှ set ရင် Streamlit error).
     if not S.get("video_path") and not S.get("src_segments"):
         _resume_rid = _find_latest_manual_run()
         if _resume_rid:
@@ -2724,6 +2708,24 @@ def main():
                     else:
                         st.error("ဖိုင်မရှိတော့ဘူး (server ပြန်စထားလို့ ဖြစ်နိုင်တယ်) — "
                                  "အသစ်ပြန်စပါ")
+
+    mode = st.radio("အရင်းအမြစ်", ["🎬 ဗီဒီယို", "📄 SRT ဖိုင်"], horizontal=True,
+                    key="src_mode",
+                    help="ဗီဒီယိုတင်ပြီး အစအဆုံးလုပ်မလား၊ "
+                         "SRT ဖိုင်အဆင်သင့်ရှိလို့ အဲ့ဒါကနေပဲ ဆက်လုပ်မလား")
+    if S.get("_mode") is not None and S["_mode"] != mode:
+        for k in ("run_id", "video_path", "audio_path", "duration",
+                  "src_segments", "translations", "final_segments",
+                  "fitted", "fit_report", "out_mp4", "out_mp3", "lang",
+                  "auto_shortened", "srt_name", "srt_is_my", "dl_base",
+                  "dl_name", "_dl_for", "scenes", "scene_descs"):
+            if k in S:
+                del S[k]
+        _reset_review_keys(S)
+        S["_mode"] = mode
+        st.rerun()
+    S["_mode"] = mode
+    is_video = (mode == "🎬 ဗီဒီယို")
 
     # 🎙️ narrator UI ဝှက်ထားတယ် (code ကျန်တယ်) — အခု စာကြောင်းချင်းပြန်ပဲ
     narr = False
