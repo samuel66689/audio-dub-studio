@@ -1965,6 +1965,44 @@ def _story_memory_block(mem):
     return ("\n" + "\n".join(out) + "\n") if out else ""
 
 
+def _transcript_fp(src_segments):
+    """transcript ပြောင်းရင် name-lock ပြန်ထုတ်ဖို့ fingerprint."""
+    h = hashlib.md5()
+    for s in (src_segments or []):
+        h.update(str(s.get("start", "")).encode())
+        h.update((s.get("text") or "").encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
+def propose_name_mm(api_key, model_id, srcs):
+    """[src name] → {src: mm}. Transliteration အကြံပြု (Gemini တစ်ကြိမ်).
+
+    မရရင် {} — ဘယ်တော့မှ error မထုတ် (အရင်အတိုင်း ဆက်လုပ်).
+    """
+    srcs = [s for s in (srcs or []) if s]
+    if not srcs:
+        return {}
+    sys = ("You transliterate Chinese drama character names into natural spoken Burmese, "
+           "as a dubbing artist would say them aloud. "
+           "Return ONLY a JSON object {\"names\": [{\"src\": <name exactly as given>, "
+           "\"mm\": <Burmese transliteration>}]}. "
+           "One natural spelling per name. "
+           "\"mm\" must be Myanmar (Burmese) Unicode script only — never Chinese, Latin, "
+           "Thai, or any other script.")
+    try:
+        res = _gemini_call(api_key, model_id, sys,
+                           "NAMES:\n" + "\n".join(f"- {s}" for s in srcs))
+    except Exception:
+        return {}
+    out = {}
+    if isinstance(res, dict):
+        for e in (res.get("names") or []):
+            if (isinstance(e, dict) and e.get("src") and e.get("mm")
+                    and re.search(r"[\u1000-\u109F]", str(e["mm"]))):
+                out[e["src"]] = str(e["mm"]).strip()
+    return out
+
+
 def build_story_memory(api_key, model_id, segments):
     """transcript ဖတ် → {characters, places, terms} (source နာမည်တွေ).
 
@@ -2882,6 +2920,48 @@ def main():
                          "ဇာတ်ကောင်နာမည်တွေ အပိုင်းတိုင်း တစ်မျိုးတည်းဖြစ်အောင် "
                          "မှတ်ဉာဏ် share သုံးမယ်")
                 _drama_name_m = (_drama_name_m or "").strip()
+                # 🎭 နာမည်သော့ — transcript ကနေ auto-ထုတ်, ပြင်လို့ရ
+                # (transcript ပြောင်းမှ ပြန်ထုတ်; table ပြင်ချက်က translate အထိ ထိန်း)
+                _mid_nl = model_id.strip() or GEMINI_MODEL_DEFAULT
+                _nl_fp = _transcript_fp(S.src_segments)
+                if S.src_segments and S.get("name_lock_fp") != _nl_fp:
+                    with st.spinner("🎭 ဇာတ်ကောင်နာမည်တွေ ထုတ်နေတယ်..."):
+                        try:
+                            _mem_tmp = build_story_memory(api_key, _mid_nl,
+                                                          S.src_segments)
+                        except Exception:
+                            _mem_tmp = {"characters": []}
+                        S.name_mem_full = _mem_tmp
+                        _dkey = (_drama_name_m or "").strip()
+                        _saved_mm = {}
+                        if _dkey:
+                            _sm = load_story_memory(_dkey) or {}
+                            for _c in (_sm.get("characters") or []):
+                                if _c.get("src") and _c.get("mm"):
+                                    _saved_mm[_c["src"]] = _c["mm"]
+                        _srcs = [c.get("src")
+                                 for c in (_mem_tmp.get("characters") or [])
+                                 if c.get("src")]
+                        _need = [s for s in _srcs if s not in _saved_mm]
+                        _prop = propose_name_mm(api_key, _mid_nl, _need)
+                        S.name_lock = [
+                            {"src": s,
+                             "mm": _saved_mm.get(s) or _prop.get(s, ""),
+                             "from": ("memory" if s in _saved_mm else "new")}
+                            for s in _srcs]
+                        S.name_lock_fp = _nl_fp
+                if S.get("name_lock"):
+                    with st.expander(
+                            f"🎭 နာမည်သော့ ({len(S.name_lock)} ခု) — "
+                            "မြန်မာစာလုံးပေါင်း ပြင်လို့ရတယ်", expanded=True):
+                        st.caption("ဘာသာပြန်တဲ့အခါ ဒီစာလုံးပေါင်းအတိအကျသာ သုံးမယ်")
+                        for _j, _nm in enumerate(S.name_lock):
+                            _kk = f"namelock_{S.run_id}_{_j}"
+                            _lbl = _nm["src"] + (" 🔒" if _nm.get("from") == "memory" else "")
+                            _cur = st.text_input(_lbl, value=_nm.get("mm", ""),
+                                                 key=_kk)
+                            if _cur != _nm.get("mm"):
+                                S.name_lock[_j]["mm"] = _cur.strip()
                 _bc3, _ = st.columns([1, 2])
                 with _bc3:
                     _go3 = st.button("🌐 သဘာဝကျတဲ့ ပြောစကားမြန်မာလို ပြန်ရန်",
@@ -2892,10 +2972,26 @@ def main():
                         _mid3 = model_id.strip() or GEMINI_MODEL_DEFAULT
                         _mem3 = (load_story_memory(_drama_name_m)
                                  if _drama_name_m else None)
-                        if _drama_name_m and not _mem3:
-                            prog.progress(0.05, "🧠 ဇာတ်ကောင်မှတ်ဉာဏ် တည်နေတယ်...")
-                            _mem3 = build_story_memory(api_key, _mid3,
-                                                       S.src_segments)
+                        if _mem3 is None:
+                            # UI အဆင့်မှာ ထုတ်ထားတဲ့ memory ပြန်သုံး
+                            # (build_story_memory ထပ်မခေါ်တော့ဘူး)
+                            _mem3 = S.get("name_mem_full") or {
+                                "characters": [], "places": [], "terms": []}
+                        # 🎭 နာမည်သော့ (user-confirmed) → hard constraint
+                        _by_src = {c.get("src"): c
+                                   for c in _mem3.get("characters", [])
+                                   if c.get("src")}
+                        for _nm in (S.get("name_lock") or []):
+                            _s = (_nm.get("src") or "").strip()
+                            _m = (_nm.get("mm") or "").strip()
+                            if _s and _m:
+                                if _s in _by_src:
+                                    _by_src[_s]["mm"] = _m
+                                else:
+                                    _nc = {"src": _s, "role": "", "mm": _m}
+                                    _mem3["characters"].append(_nc)
+                                    _by_src[_s] = _nc
+                        if _drama_name_m:
                             save_story_memory(_drama_name_m, _mem3)
                         result, failed = gemini_translate(
                             api_key, S.src_segments, _mid3,
