@@ -752,6 +752,14 @@ _TIKTOK_SYS = (
     "If the model cannot render Burmese script cleanly, it must leave the top third empty instead.")
 
 
+def _copy_to_clipboard(text):
+    """Client clipboard ထဲ စာထည့် (HTTPS + user tap gesture လိုတယ်)."""
+    import streamlit.components.v1 as components
+    components.html(
+        "<script>navigator.clipboard.writeText(%s);</script>" % json.dumps(text or ""),
+        height=0)
+
+
 def _tiktok_pack(api_key, model_id, segments, dl_base, setting_hint=""):
     """Dub ပြီးသားလိုင်းတွေ → TikTok caption + hashtag + Flow poster prompt (JSON dict)."""
     lines = [f"{i + 1}. {s['text']}" for i, s in enumerate(segments[:150])]
@@ -3475,17 +3483,32 @@ def main():
                 _tp = S.get("tiktok_pack")
                 if _tp:
                     _tg = S.get("_tt_gen", 0)
-                    st.text_area("📝 Caption (ထိထိမိမိ တစ်ကြောင်း)",
-                                 _tp.get("caption", ""), key=f"tt_caption_{_tg}")
-                    st.text_area("#️⃣ Hashtags",
-                                 " ".join(_tp.get("hashtags", "") or []),
-                                 key=f"tt_tags_{_tg}")
+
+                    def _tt_row(label, value, area_key, copy_key, copy_name, height=None):
+                        _c1, _c2 = st.columns([6, 1])
+                        with _c1:
+                            if height:
+                                st.text_area(label, value, height=height, key=area_key)
+                            else:
+                                st.text_area(label, value, key=area_key)
+                        with _c2:
+                            st.markdown("<br>", unsafe_allow_html=True)
+                            if st.button("📋", key=copy_key, help=f"{copy_name} copy"):
+                                _copy_to_clipboard(S.get(area_key, ""))
+                                st.toast(f"✅ {copy_name} copy ပြီးပြီ")
+
+                    _tt_row("📝 Caption (ထိထိမိမိ တစ်ကြောင်း)",
+                            _tp.get("caption", ""), f"tt_caption_{_tg}",
+                            f"tt_copy_cap_{_tg}", "Caption")
+                    _tt_row("#️⃣ Hashtags",
+                            " ".join(_tp.get("hashtags", "") or []),
+                            f"tt_tags_{_tg}", f"tt_copy_tag_{_tg}", "Hashtags")
                     _pt, _ps = _tp.get("poster_title", ""), _tp.get("poster_sub", "")
                     if _pt or _ps:
                         st.caption(f"🖼️ ပုံထဲစာ: {_pt}" + (f" / {_ps}" if _ps else ""))
-                    st.text_area("🎨 Poster Prompt (Flow AI ထဲ paste)",
-                                 _tp.get("poster_prompt", ""), height=180,
-                                 key=f"tt_prompt_{_tg}")
+                    _tt_row("🎨 Poster Prompt (Flow AI ထဲ paste)",
+                            _tp.get("poster_prompt", ""), f"tt_prompt_{_tg}",
+                            f"tt_copy_prm_{_tg}", "Prompt", height=180)
         _spidey_card_close()
     # ---- wizard အောက် nav: စာအပေါ်, ခလုတ် ၂ ခု ဘေးချင်းကပ်
     _cur = max(1, min(6, int(S.get("wizard_step", 1))))
