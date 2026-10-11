@@ -752,12 +752,20 @@ _TIKTOK_SYS = (
     "If the model cannot render Burmese script cleanly, it must leave the top third empty instead.")
 
 
-def _copy_to_clipboard(text):
-    """Client clipboard ထဲ စာထည့် (HTTPS + user tap gesture လိုတယ်)."""
+def _copy_button(text, key):
+    """📋 button — တိုက်ရိုက်နှိပ်မှ clipboard ထဲ ကူးတယ် (user gesture).
+    Streamlit button + rerun နည်းက clipboard permission မရလို့ အလုပ်မဖြစ်ဘူး."""
     import streamlit.components.v1 as components
+    js_text = json.dumps(text or "")
     components.html(
-        "<script>navigator.clipboard.writeText(%s);</script>" % json.dumps(text or ""),
-        height=0)
+        '<button id="cpbtn_%s" title="Copy" style="font-size:20px;cursor:pointer;'
+        'background:#1f2937;color:#fff;border:1px solid #4b5563;border-radius:10px;'
+        'padding:6px 10px;">&#128203;</button>'
+        '<script>document.getElementById("cpbtn_%s").onclick = async function(){'
+        'var b=this;try{await navigator.clipboard.writeText(%s);'
+        'b.innerHTML="&#9989;";setTimeout(function(){b.innerHTML="&#128203;";},1500);}'
+        'catch(e){b.innerHTML="&#10060;";}};</script>' % (key, key, js_text),
+        height=56)
 
 
 def _tiktok_pack(api_key, model_id, segments, dl_base, setting_hint=""):
@@ -772,12 +780,24 @@ def _tiktok_pack(api_key, model_id, segments, dl_base, setting_hint=""):
     tags = data.get("hashtags") or []
     if isinstance(tags, str):
         tags = [tags]
+    title = str(data.get("poster_title") or "").strip()
+    sub = str(data.get("poster_sub") or "").strip()
+    prompt = str(data.get("poster_prompt") or "").strip()
+    # ပုံထဲစာ spec ကို code ကနေ တိုက်ရိုက်ထည့် — Gemini မေ့သွားလည်း ပါမယ်
+    if title and title not in prompt:
+        spec = ('\n\nTEXT TO RENDER (exact Burmese): "%s" as a large bold white title '
+                'with black outline across the top' % title)
+        if sub:
+            spec += ' and "%s" as a smaller bold yellow sub-line directly beneath it' % sub
+        spec += ('. No other text in the image. If Burmese script cannot be rendered '
+                 'cleanly, leave the top third empty instead.')
+        prompt = (prompt + spec).strip()
     return {
         "caption": str(data.get("caption") or "").strip(),
         "hashtags": [str(t).strip() for t in tags if str(t).strip()][:14],
-        "poster_title": str(data.get("poster_title") or "").strip(),
-        "poster_sub": str(data.get("poster_sub") or "").strip(),
-        "poster_prompt": str(data.get("poster_prompt") or "").strip(),
+        "poster_title": title,
+        "poster_sub": sub,
+        "poster_prompt": prompt,
     }
 
 
@@ -3484,7 +3504,7 @@ def main():
                 if _tp:
                     _tg = S.get("_tt_gen", 0)
 
-                    def _tt_row(label, value, area_key, copy_key, copy_name, height=None):
+                    def _tt_row(label, value, area_key, copy_key, height=None):
                         _c1, _c2 = st.columns([6, 1])
                         with _c1:
                             if height:
@@ -3493,22 +3513,20 @@ def main():
                                 st.text_area(label, value, key=area_key)
                         with _c2:
                             st.markdown("<br>", unsafe_allow_html=True)
-                            if st.button("📋", key=copy_key, help=f"{copy_name} copy"):
-                                _copy_to_clipboard(S.get(area_key, ""))
-                                st.toast(f"✅ {copy_name} copy ပြီးပြီ")
+                            _copy_button(S.get(area_key, ""), copy_key)
 
                     _tt_row("📝 Caption (ထိထိမိမိ တစ်ကြောင်း)",
                             _tp.get("caption", ""), f"tt_caption_{_tg}",
-                            f"tt_copy_cap_{_tg}", "Caption")
+                            f"tt_copy_cap_{_tg}")
                     _tt_row("#️⃣ Hashtags",
                             " ".join(_tp.get("hashtags", "") or []),
-                            f"tt_tags_{_tg}", f"tt_copy_tag_{_tg}", "Hashtags")
+                            f"tt_tags_{_tg}", f"tt_copy_tag_{_tg}")
                     _pt, _ps = _tp.get("poster_title", ""), _tp.get("poster_sub", "")
                     if _pt or _ps:
                         st.caption(f"🖼️ ပုံထဲစာ: {_pt}" + (f" / {_ps}" if _ps else ""))
                     _tt_row("🎨 Poster Prompt (Flow AI ထဲ paste)",
                             _tp.get("poster_prompt", ""), f"tt_prompt_{_tg}",
-                            f"tt_copy_prm_{_tg}", "Prompt", height=180)
+                            f"tt_copy_prm_{_tg}", height=180)
         _spidey_card_close()
     # ---- wizard အောက် nav: စာအပေါ်, ခလုတ် ၂ ခု ဘေးချင်းကပ်
     _cur = max(1, min(6, int(S.get("wizard_step", 1))))
