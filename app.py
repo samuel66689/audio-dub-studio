@@ -742,16 +742,21 @@ _TIKTOK_SYS = (
     "poster_sub = Burmese sub-line like 'episode {N} + short hook' using the filename hint for N. "
     "poster_prompt = English image prompt for a 9:16 vertical cinematic movie poster of the single "
     "most dramatic or emotional moment in these lines. Photorealistic, dramatic lighting, no watermark. "
+    "The background, costumes and architecture MUST match the drama setting given in setting_hint "
+    "(if the hint is empty, infer the setting from character names and dialogue). "
+    "NEVER default to Myanmar/Burmese village scenery just because the poster title text is Burmese - "
+    "the text language does not decide the setting. "
     "It MUST instruct the image model to render this EXACT Burmese text: the poster_title as a large "
     "bold white title with black outline across the top, and the poster_sub as a smaller bold yellow "
     "sub-line directly beneath it. No other text in the image. "
     "If the model cannot render Burmese script cleanly, it must leave the top third empty instead.")
 
 
-def _tiktok_pack(api_key, model_id, segments, dl_base):
+def _tiktok_pack(api_key, model_id, segments, dl_base, setting_hint=""):
     """Dub ပြီးသားလိုင်းတွေ → TikTok caption + hashtag + Flow poster prompt (JSON dict)."""
     lines = [f"{i + 1}. {s['text']}" for i, s in enumerate(segments[:150])]
     payload = ("filename_hint: " + (dl_base or "") + "\n"
+               "setting_hint: " + (setting_hint or "") + "\n"
                "dubbed_lines:\n" + "\n".join(lines))
     data = _gemini_call(api_key, model_id, _TIKTOK_SYS, payload)
     if not isinstance(data, dict):
@@ -3447,6 +3452,11 @@ def main():
                 st.markdown("### 📱 TikTok ထုတ်ရန်")
                 st.caption("Caption + hashtag + Flow AI poster prompt — "
                            "dub ပြီးသားစာသားတွေကို ဖတ်ပြီး ထုတ်ပေးမယ်")
+                _tt_setting = st.text_input("🏯 Background setting",
+                    value=S.get("_tt_setting", "တရုတ်ဇာတ်လမ်း"),
+                    help="ပိုစတာ နောက်ခံ ဘယ်လိုပုံစံလဲ — ဇာတ်လမ်းနဲ့ လိုက်အောင်",
+                    key="tiktok_setting_input")
+                S["_tt_setting"] = _tt_setting
                 if st.button("✨ Caption + Prompt ထုတ်ရန်", type="primary",
                              use_container_width=True, key="tiktok_gen_btn"):
                     if not api_key:
@@ -3456,7 +3466,8 @@ def main():
                             try:
                                 S.tiktok_pack = _tiktok_pack(
                                     api_key, model_id.strip() or GEMINI_MODEL_DEFAULT,
-                                    S.final_segments, S.get("dl_base"))
+                                    S.final_segments, S.get("dl_base"),
+                                    setting_hint=_tt_setting)
                                 S["_tt_gen"] = S.get("_tt_gen", 0) + 1
                                 _manual_ckpt_save(S, is_video)
                             except Exception as e:
