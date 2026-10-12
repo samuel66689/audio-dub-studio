@@ -271,6 +271,10 @@ VOICE_FEMALE = "my-MM-NilarNeural"
 # သက်သေပြ sequential (False) ကို ပြန်ထားတယ်. True ပြန်လုပ်မယ်ဆိုရင်
 # Microsoft ဘက်က concurrent traffic လက်ခံတာ အတည်ပြုပြီးမှသာ.
 TTS_CONCURRENT = False
+# 📱 phone relay — Microsoft block ခံထားရတဲ့အခါ Termux relay ကို သုံး.
+# UI (Step 5 expander) က URL/token ထည့်ရင် _sync_relay_config() က ဒါတွေကို set မယ်.
+_RELAY_URL = ""
+_RELAY_TOKEN = ""
 
 
 # ------------------------------------------------------------------ helpers
@@ -1209,12 +1213,54 @@ def _valid_audio(path):
     return os.path.isfile(path) and os.path.getsize(path) > 1000
 
 
+async def _relay_save(text, voice, path, relay_url, relay_token):
+    """📱 phone relay → MP3 (atomic write). relay server (Termux) ကို HTTP GET."""
+    import aiohttp
+    url = relay_url.rstrip("/") + "/tts"
+    try:
+        timeout = aiohttp.ClientTimeout(total=75)
+        async with aiohttp.ClientSession(timeout=timeout) as sess:
+            async with sess.get(url, params={"text": text, "voice": voice,
+                                             "token": relay_token}) as r:
+                if r.status != 200:
+                    raise RuntimeError(f"relay HTTP {r.status}")
+                data = await r.read()
+    except Exception as e:
+        raise RuntimeError(f"relay fail: {type(e).__name__}: {e}")
+    if len(data) < 1000:
+        raise RuntimeError("relay empty audio")
+    tmp = path + ".part"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def _sync_relay_config():
+    """st.session_state relay_url/token → module globals (for _edge_save)."""
+    global _RELAY_URL, _RELAY_TOKEN
+    try:
+        _RELAY_URL = (st.session_state.get("relay_url") or "").strip().rstrip("/")
+        _RELAY_TOKEN = (st.session_state.get("relay_token") or "").strip()
+    except Exception:
+        pass
+
+
 async def _edge_save(text, voice, path):
     """edge-tts → tmp .part မှာ ရေး → size စစ် → ပြီးမှ cache path ကို replace.
 
     ကြားဖြတ်ပျက်ရင် ဖိုင်တစ်ဝက် cache ပေါ် မကျန်ဘူး (atomic write) —
     အရင်က တစ်ဝက်ဖိုင်ကို 1KB ကျော်ရင် "အကောင်း" အဖြစ် ထာဝရမှတ်မိတာ.
+    📱 phone relay set ထားရင် relay ကို သုံး (Microsoft block ကျော်).
     """
+    if _RELAY_URL:
+        return await _relay_save(text, voice, path, _RELAY_URL, _RELAY_TOKEN)
     import edge_tts
     tmp = path + ".part"
     try:
@@ -1475,6 +1521,88 @@ if __name__ == "__main__":
 """
 
 
+RELAY_SCRIPT = """#!/usr/bin/env python3
+# 📱 Phone TTS relay — Termux မှာ run
+#
+#   1. pkg install cloudflared -y   (တစ်ခါတည်း)
+#   2. python relay.py 8000 mytoken123
+#   3. နောက် session တစ်ခု:  cloudflared tunnel --url http://localhost:8000
+#      → https://xxx.trycloudflare.com  ဆိုတဲ့ URL ရမယ်
+#   4. App → Step 5 → phone expander → URL + token ထည့် → Test
+#
+# TTS လုပ်နေတုန်း Termux ဖွင့်ထား + screen မပိတ်နဲ့.
+
+import asyncio
+import os
+import sys
+import tempfile
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
+
+PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
+TOKEN = sys.argv[2] if len(sys.argv) > 2 else "dub123"
+
+import edge_tts
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        u = urlparse(self.path)
+        if u.path == "/":
+            body = b"ok - phone tts relay"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if u.path != "/tts":
+            self.send_error(404)
+            return
+        q = parse_qs(u.query)
+        if q.get("token", [""])[0] != TOKEN:
+            self.send_error(403, "bad token")
+            return
+        text = q.get("text", [""])[0]
+        voice = q.get("voice", [""])[0]
+        if not text.strip() or not voice.strip():
+            self.send_error(400)
+            return
+        fd, fn = tempfile.mkstemp(suffix=".mp3")
+        os.close(fd)
+        try:
+            asyncio.run(asyncio.wait_for(
+                edge_tts.Communicate(text, voice).save(fn), timeout=60))
+            if not os.path.exists(fn) or os.path.getsize(fn) < 1000:
+                self.send_error(502, "tts failed")
+                return
+            with open(fn, "rb") as f:
+                data = f.read()
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/mpeg")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except Exception as e:
+            try:
+                self.send_error(500, type(e).__name__)
+            except Exception:
+                pass
+        finally:
+            if os.path.exists(fn):
+                try:
+                    os.unlink(fn)
+                except OSError:
+                    pass
+
+    def log_message(self, *a):
+        sys.stderr.write("[relay] %s\\n" % (a[1] if len(a) > 1 else ""))
+
+
+print("relay on 127.0.0.1:%d  token=%s" % (PORT, TOKEN), flush=True)
+ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+"""
+
+
 PHONE_TTS_README = """ဖုန်း TTS လမ်း - လုပ်နည်း
 ========================
 
@@ -1499,6 +1627,17 @@ Server TTS က Microsoft block ခံထားရလို့ ဒီနည်း
 - WiFi/4G ဖွင့်ထားပါ
 - Termux ကို screen ပိတ်ရင် ရပ်သွားနိုင်တယ် -
   screen မပိတ်အောင် ထားတာ အကောင်းဆုံး
+
+🔗 Phone relay (auto — zip/upload မလို)
+========================================
+1. pkg install cloudflared -y
+2. python relay.py 8000 <token>   (token ကြိုက်တာထား, ဥပမာ abc123)
+3. နောက် Termux session တစ်ခု ဖွင့်:
+     cloudflared tunnel --url http://localhost:8000
+   → https://xxx.trycloudflare.com  ဆိုတဲ့ URL ရမယ်
+4. App → အဆင့် ၅ → "ဖုန်းနဲ့ အသံထုတ်မယ်" → URL + token ထည့် → Test
+5. "အသံထုတ်ရန်" နှိပ် — ဖုန်းကနေ auto ထုတ်ပေးမယ်!
+   (TTS လုပ်နေတုန်း Termux ဖွင့်ထား + screen မပိတ်နဲ့)
 """
 
 
@@ -1519,6 +1658,7 @@ def _build_phone_tts_zip(segments, voice):
         z.writestr("tts_lines.json",
                    json.dumps(payload, ensure_ascii=False, indent=1))
         z.writestr("tts_phone.py", PHONE_TTS_SCRIPT)
+        z.writestr("relay.py", RELAY_SCRIPT)
         z.writestr("README_ဖတ်ရန်.txt", PHONE_TTS_README)
     return buf.getvalue()
 
@@ -3599,6 +3739,10 @@ def main():
         else:
             st.caption("အသံတစ်ကြောင်းချင်းကို သူ့အချိန်ကွက်ထဲ အတိအကျထည့်မယ် — "
                        f"ရှည်ရင် {max_speed}x အထိ မြန်ပေးမယ်၊ နောက်အပိုင်းနဲ့ ဘယ်တော့မှ မထပ်စေဘူး။")
+            _sync_relay_config()  # 📱 phone relay URL/token → _edge_save
+            if _RELAY_URL:
+                st.info("📱 Phone relay ချိတ်ထားတယ် — “🔊 အသံထုတ်ရန်” နှိပ်ရင် "
+                        "ဖုန်းကနေ auto ထုတ်မယ်.")
             def _run_step5_fit(premade=None):
                 """premade=None → server TTS; premade=[path|None] → ဖုန်း MP3."""
                 from_phone = premade is not None
@@ -3678,6 +3822,32 @@ def main():
                 except Exception:
                     _ettv = "?"
                 st.caption(f"🔧 server edge-tts version: `{_ettv}`")
+                st.markdown("**🔗 Phone relay (auto)** — Termux မှာ "
+                            "`python relay.py` + cloudflared run ထားရင်:")
+                _ru_in = st.text_input("Relay URL",
+                                       placeholder="https://xxx.trycloudflare.com",
+                                       key="relay_url")
+                _rt_in = st.text_input("Relay token", type="password",
+                                       key="relay_token")
+                _test_relay = st.button("🔌 Relay စမ်းရန်", use_container_width=True)
+                if _test_relay:
+                    _sync_relay_config()
+                    if not _RELAY_URL:
+                        st.error("URL ထည့်ပါ.")
+                    else:
+                        import asyncio as _aio
+                        _tdir = os.path.join(WORK_DIR, S.run_id, "relay_test")
+                        os.makedirs(_tdir, exist_ok=True)
+                        _tp = os.path.join(_tdir, "test.mp3")
+                        try:
+                            _aio.run(_relay_save("စမ်းသပ်မှု", voice, _tp,
+                                                 _RELAY_URL, _RELAY_TOKEN))
+                            st.success("✅ Relay ရတယ်! “🔊 အသံထုတ်ရန်” နှိပ်ရင် "
+                                       "ဖုန်းကနေ auto ထုတ်မယ်.")
+                        except Exception as _re:
+                            st.error(f"⛔ Relay မရဘူး: {_re}")
+                st.divider()
+                st.caption("**Manual (zip) လမ်း** — relay မသုံးချင်ရင်:")
                 st.download_button("📤 စာသား + script ဒေါင်းရန်",
                                    data=_build_phone_tts_zip(S.final_segments, voice),
                                    file_name="phone_tts.zip",
