@@ -1205,13 +1205,30 @@ def _valid_audio(path):
 
 
 async def _edge_save(text, voice, path):
+    """edge-tts → tmp .part မှာ ရေး → size စစ် → ပြီးမှ cache path ကို replace.
+
+    ကြားဖြတ်ပျက်ရင် ဖိုင်တစ်ဝက် cache ပေါ် မကျန်ဘူး (atomic write) —
+    အရင်က တစ်ဝက်ဖိုင်ကို 1KB ကျော်ရင် "အကောင်း" အဖြစ် ထာဝရမှတ်မိတာ.
+    """
     import edge_tts
-    await edge_tts.Communicate(text, voice).save(path)
+    tmp = path + ".part"
+    try:
+        await edge_tts.Communicate(text, voice).save(tmp)
+        if not os.path.isfile(tmp) or os.path.getsize(tmp) <= 1000:
+            raise RuntimeError("empty audio")
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
 
 def _tts_cache_path(text, voice_primary):
     """edge-tts cache file path — key = voice + text."""
-    key = hashlib.sha1(f"edge:{voice_primary}:{text}".encode("utf-8")).hexdigest()[:16]
+    # edge2: — အရင် key နဲ့ သိမ်းထားတဲ့ တစ်ဝက်ဖိုင်တွေ (poisoned cache) ကျော်ဖို့
+    key = hashlib.sha1(f"edge2:{voice_primary}:{text}".encode("utf-8")).hexdigest()[:16]
     return os.path.join(CACHE_TTS, f"{key}.mp3")
 
 
@@ -1265,7 +1282,8 @@ def fit_segment(src_mp3, slot, gap_after, max_speed, out_path):
 
 
 def _parallel_tts_fetch(texts, voice_primary, voice_fallback, tick=None):
-    """texts[i] → mp3 path / None. cache-hit တွေကျော်, ကျန်တာ 6 ပြိုင်နက် edge-tts.
+    """texts[i] → mp3 path / None. cache-hit တွေကျော်, ကျန်တာ 3 ပြိုင်နက် edge-tts
+(throttle ကာကွယ်ဖို့) + voice တစ်ခုကို ၂ ကြိမ် retry/backoff.
 
     စာသားထပ်နေတာတွေ dedup (ဖိုင်တူကို ပြိုင်ရေးမိမှာစိုးလို့ တစ်ခါပဲထုတ်,
     ကျန်တာက alias ပြန်ယူ). ရလဒ်အစဉ်က လိုင်းနံပါတ်အတိုင်း ပြန်စီထားတယ်.
@@ -1286,27 +1304,30 @@ def _parallel_tts_fetch(texts, voice_primary, voice_fallback, tick=None):
             paths[i] = ("alias", seen[cp])
         else:
             seen[cp] = i
-            jobs.append((i, t, cp))
+            jobs.append((i, t))
 
     async def _run():
-        sem = asyncio.Semaphore(6)
+        sem = asyncio.Semaphore(3)  # Microsoft throttle ကာကွယ်ဖို့ 6→3
         out = {}
         done = [0]
 
-        async def _one(i, text, path):
+        async def _one(i, text):
             async with sem:
-                got = None
                 for v in (voice_primary, voice_fallback):
-                    try:
-                        await _edge_save(text, v, path)
-                        if _valid_audio(path):
-                            got = path
-                            break
-                    except Exception:
-                        continue
-                return i, got
+                    vp = _tts_cache_path(text, v)  # voice အမှန်နဲ့ key (fallback audio မှားသိမ်းတာ ပြင်)
+                    if _valid_audio(vp):
+                        return i, vp
+                    for attempt in range(2):
+                        try:
+                            await _edge_save(text, v, vp)
+                            if _valid_audio(vp):
+                                return i, vp
+                        except Exception:
+                            pass
+                        await asyncio.sleep(2.0 * (attempt + 1))
+                return i, None
 
-        tasks = [asyncio.ensure_future(_one(i, t, cp)) for i, t, cp in jobs]
+        tasks = [asyncio.ensure_future(_one(i, t)) for i, t in jobs]
         for fut in asyncio.as_completed(tasks):
             i, got = await fut
             out[i] = got
@@ -1327,7 +1348,8 @@ def _parallel_tts_fetch(texts, voice_primary, voice_fallback, tick=None):
 def tts_and_fit(segments, voice, max_speed, work_segs, progress_cb=None, tts_fn=None):
     """segments: [{'start','end','text'}] → fitted mp3 တွေ.
 
-    အသံထုတ်တဲ့ (network) အပိုင်းကို 6 ပြိုင်နက်ထုတ် → ပြီးမှ တကြောင်းချင်း
+    အသံထုတ်တဲ့ (network) အပိုင်းကို 3 ပြိုင်နက်ထုတ် (retry+backoff ပါ) →
+    ကျန်တဲ့ None တွေ တစ်ကြောင်းချင်း fallback → ပြီးမှ တကြောင်းချင်း
     duration တိုင်း + slot ထဲချိန် (အရင်အတိုင်း — sync logic လုံးဝမထိဘူး).
     parallel ပျက်ရင် တကြောင်းချင်းနည်းနဲ့ အလိုအလျောက်ပြန်လုပ်.
 
@@ -1350,6 +1372,14 @@ def tts_and_fit(segments, voice, max_speed, work_segs, progress_cb=None, tts_fn=
             src_list = _parallel_tts_fetch(texts, voice, VOICE_FEMALE, tick=_tick)
         except Exception:
             src_list = None  # fallback → အောက်က တကြောင်းချင်းနည်း
+
+    if src_list is not None:
+        # parallel ကျန်ခဲ့တဲ့ None တွေ → တစ်ကြောင်းချင်း gentle fallback.
+        # (အရင် ဒီ fallback က exception တက်မှသာ အလုပ်လုပ်ခဲ့တာ — လိုင်းချင်းပျက်တဲ့
+        #  None တွေ ဘယ်တော့မှ ဒီမရောက်ခဲ့ဘူး. အခု comment ရဲ့ ကတိအတိုင်း တကယ်လုပ်.)
+        for i in range(n):
+            if src_list[i] is None and texts[i].strip():
+                src_list[i] = tts_segment(texts[i], voice, VOICE_FEMALE)
 
     for i, s in enumerate(segments):
         start, end, text = s["start"], s["end"], texts[i]
@@ -1430,7 +1460,8 @@ def tts_natural(segments, voice, work_segs, progress_cb=None):
 
     fit_segment လို slot ထဲ အတင်းမထည့်ဘူး — TTS သဘာဝအရှည်အတိုင်း.
     Recap render အတွက် narration အရှည်တိုင်းဖို့ သုံးတယ်.
-    Cache လွတ်တဲ့အပိုင်းတွေကို asyncio.gather + Semaphore(6) နဲ့ ပြိုင်တူထုတ်တယ်.
+    Cache လွတ်တဲ့အပိုင်းတွေကို 3 ပြိုင်နက် ထုတ်တယ် (throttle ကာကွယ်ဖို့) +
+    voice တစ်ခုကို ၂ ကြိမ် retry/backoff + ကျန်တာ တစ်ကြောင်းချင်း fallback.
     """
     os.makedirs(work_segs, exist_ok=True)
     out, failed = [], []
@@ -1465,45 +1496,43 @@ def tts_natural(segments, voice, work_segs, progress_cb=None):
         if mp3[i] is not None or not texts[i] or i in alias:
             _tick(i)
 
-    async def _fetch(jobs, report):
-        sem = asyncio.Semaphore(6)
+    async def _fetch(jobs):
+        sem = asyncio.Semaphore(3)  # Microsoft throttle ကာကွယ်ဖို့ 6→3
 
-        async def _one(i, text, v, path):
+        async def _one(i, text):
             async with sem:
-                try:
-                    await _edge_save(text, v, path)
-                    ok = _valid_audio(path)
-                except Exception:
-                    ok = False
-                return i, ok
+                for v in (voice, VOICE_FEMALE):
+                    vp = _tts_cache_path(text, v)  # voice အမှန်နဲ့ key
+                    if _valid_audio(vp):
+                        return i, vp
+                    for attempt in range(2):
+                        try:
+                            await _edge_save(text, v, vp)
+                            if _valid_audio(vp):
+                                return i, vp
+                        except Exception:
+                            pass
+                        await asyncio.sleep(2.0 * (attempt + 1))
+                return i, None
 
-        tasks = [asyncio.ensure_future(_one(i, t, v, p)) for i, t, v, p in jobs]
+        tasks = [asyncio.ensure_future(_one(i, t)) for i, t in jobs]
         results = []
         for fut in asyncio.as_completed(tasks):
-            i, ok = await fut
-            results.append((i, ok))
-            if report:
-                _tick(i)
+            i, got = await fut
+            results.append((i, got))
+            _tick(i)
         return results
 
     if todo:
-        by_i = {i: (text, path) for i, text, path in todo}
-        res1 = asyncio.run(_fetch(
-            [(i, t, voice, p) for i, (t, p) in by_i.items()], True))
-        need_retry = []
-        for i, ok in res1:
-            if ok:
-                mp3[i] = by_i[i][1]
-            else:
-                need_retry.append(i)
-        if need_retry:
-            # fallback voice နဲ့ တစ်ကြိမ်ထပ်ကြိုး (cache path က primary key အတိုင်း)
-            res2 = asyncio.run(_fetch(
-                [(i, by_i[i][0], VOICE_FEMALE, by_i[i][1]) for i in need_retry],
-                False))
-            for i, ok in res2:
-                if ok:
-                    mp3[i] = by_i[i][1]
+        for i, got in asyncio.run(_fetch([(i, t) for i, t, _p in todo])):
+            if got:
+                mp3[i] = got
+        # parallel ကျန်ခဲ့တာတွေ → တစ်ကြောင်းချင်း gentle fallback
+        for i, text, _p in todo:
+            if mp3[i] is None:
+                fp = tts_segment(text, voice, VOICE_FEMALE)
+                if fp:
+                    mp3[i] = fp
 
     for i, s in enumerate(segments):
         if i in alias:  # စာသားထပ်နေတာ → ပထမအပိုင်းရဲ့ mp3 ကို ပြန်သုံး
