@@ -1523,22 +1523,13 @@ def _build_phone_tts_zip(segments, voice):
     return buf.getvalue()
 
 
-def _premade_from_zip(zip_file, segments, voice, outdir):
-    """ဖုန်း MP3 zip -> [path|None] per line.
-    hash နဲ့ ချိတ် ({hash}.mp3) - စာပြင်လိုက်တဲ့လိုင်း -> None (နေရာလွဲမကပ်ဘူး).
-    hash ဖိုင်မရှိတဲ့ zip အဟောင်း (000.mp3...) ဆို နံပါတ်အတိုင်း ချိတ် (legacy).
-    MP3 လုံးဝမတွေ့ရင် None."""
-    import zipfile
-    if os.path.exists(outdir):
-        shutil.rmtree(outdir)
-    os.makedirs(outdir, exist_ok=True)
-    try:
-        with zipfile.ZipFile(zip_file) as z:
-            z.extractall(outdir)
-    except Exception:
+def _match_phone_mp3s(segments, voice, phone_dir):
+    """phone_dir ထဲက MP3 တွေကို segments နဲ့ ချိတ် → [path|None] per line.
+    hash နဲ့ အရင်ရှာ ({hash}.mp3); မရှိရင် legacy နံပါတ် (000.mp3)."""
+    if not phone_dir or not os.path.isdir(phone_dir):
         return None
     by_hash, by_pos = {}, {}
-    for root, _ds, fs in os.walk(outdir):
+    for root, _ds, fs in os.walk(phone_dir):
         for fn in fs:
             mh = re.match(r"^([0-9a-f]{16})\.mp3$", fn, re.IGNORECASE)
             if mh:
@@ -1557,6 +1548,23 @@ def _premade_from_zip(zip_file, segments, voice, outdir):
             p = by_pos.get(i)
         premade.append(p if (p and _valid_audio(p)) else None)
     return premade
+
+
+def _premade_from_zip(zip_file, segments, voice, outdir):
+    """ဖုန်း MP3 zip -> [path|None] per line.
+    hash နဲ့ ချိတ် ({hash}.mp3) - စာပြင်လိုက်တဲ့လိုင်း -> None (နေရာလွဲမကပ်ဘူး).
+    hash ဖိုင်မရှိတဲ့ zip အဟောင်း (000.mp3...) ဆို နံပါတ်အတိုင်း ချိတ် (legacy).
+    MP3 လုံးဝမတွေ့ရင် None."""
+    import zipfile
+    if os.path.exists(outdir):
+        shutil.rmtree(outdir)
+    os.makedirs(outdir, exist_ok=True)
+    try:
+        with zipfile.ZipFile(zip_file) as z:
+            z.extractall(outdir)
+    except Exception:
+        return None
+    return _match_phone_mp3s(segments, voice, outdir)
 
 
 def tts_and_fit(segments, voice, max_speed, work_segs, progress_cb=None, tts_fn=None, premade=None):
@@ -1774,10 +1782,16 @@ def tts_natural(segments, voice, work_segs, progress_cb=None):
         else:
             # sequential, တစ်ကြောင်းချင်း — သက်သေပြ reliable လမ်း
             _serrs = []
+            _consec_fail = 0
             for i, text, _p in todo:
                 got = tts_segment(text, voice, VOICE_FEMALE, err_out=_serrs)
                 if got:
                     mp3[i] = got
+                    _consec_fail = 0
+                else:
+                    _consec_fail += 1
+                    if _consec_fail >= 3 and not any(mp3):
+                        break  # အစကနေ ၃ ဆက်ပျက် → systemic block → ဆက်မလုပ်နဲ့
                 _tick(i)
             if _serrs:
                 tts_err = _serrs[0]
@@ -3713,10 +3727,31 @@ def main():
                         if recap_render and S.final_segments and S.video_path:
                             # 🎞️ recap render: သဘာဝအသံထုတ် → video ချိန် → mux
                             work_nat = os.path.join(WORK_DIR, S.run_id, "natural")
-                            _pn = st.progress(0.0, "Recap အသံ သဘာဝအတိုင်းထုတ်နေတယ်...")
-                            natural, _failed_n, _nerr = tts_natural(
-                                S.final_segments, voice, work_nat,
-                                progress_cb=lambda f, i, t: _pn.progress(f))
+                            _pn = st.progress(0.0, "Recap အသံပြင်နေတယ်...")
+                            _ph_pre = _match_phone_mp3s(
+                                S.final_segments, voice,
+                                os.path.join(WORK_DIR, S.run_id, "phone"))
+                            if _ph_pre and any(_ph_pre):
+                                # 📱 ဖုန်း MP3 — server TTS လုံးဝကျော်
+                                natural, _failed_n, _nerr = [], [], ""
+                                for _i6, _s6 in enumerate(S.final_segments):
+                                    _p6 = _ph_pre[_i6]
+                                    _t6 = (_s6.get("text") or "").strip()
+                                    if _p6:
+                                        natural.append({
+                                            "start": float(_s6.get("start", 0.0)),
+                                            "end": float(_s6.get("end", 0.0)),
+                                            "text": _t6, "mp3": _p6,
+                                            "dur": dur(_p6)})
+                                    elif _t6:
+                                        _failed_n.append(
+                                            (_i6, _s6.get("start", 0.0), _t6[:60]))
+                                _pn.progress(1.0)
+                            else:
+                                _pn.progress(0.0, "Recap အသံ သဘာဝအတိုင်းထုတ်နေတယ်...")
+                                natural, _failed_n, _nerr = tts_natural(
+                                    S.final_segments, voice, work_nat,
+                                    progress_cb=lambda f, i, t: _pn.progress(f))
                             _pn.empty()
                             if not natural:
                                 st.error("⛔ Recap အသံလုံးဝထုတ်မရဘူး — "
