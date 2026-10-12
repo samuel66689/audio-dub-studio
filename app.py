@@ -1373,15 +1373,20 @@ PHONE_TTS_SCRIPT = """#!/usr/bin/env python3
 #   1. Termux ဖွင့် ->  pkg install python -y
 #   2. pip install edge-tts
 #   3. phone_tts.zip ကို ဖြည် -> ဒီ folder ထဲဝင် (cd)
-#   4. python tts_phone.py
-#   5. ပြီးရင် tts_out/ folder ကို zip လုပ် -> app ရဲ့ "ဖုန်း MP3 zip" မှာ တင်
+#   4. python tts_phone.py   (၄ ခုပြိုင် ထုတ်မယ်)
+#   5. ပြီးရင် ~/storage/downloads/tts_out.zip အလိုအလျောက်ထွက်မယ်
+#      -> app ရဲ့ "ဖုန်း MP3 zip" မှာ တင်
 #
 # ရပ်သွားရင် ပြန် run - ပြီးသား MP3 တွေ skip မယ် (resume ရတယ်).
+# ဖိုင်နာမည်က စာသားရဲ့ hash မို့ - app မှာ စာပြင်လိုက်ရင်
+# အသံမှားမကပ်ဘူး, ပြင်တဲ့လိုင်းပဲ "မရှိ" လို့ ပြမယ်.
 
 import asyncio
 import json
 import os
 import sys
+
+CONCURRENT = 4
 
 
 def main():
@@ -1389,7 +1394,6 @@ def main():
     with open(os.path.join(base, "tts_lines.json"), encoding="utf-8") as f:
         data = json.load(f)
     voice = data["voice"]
-    fallback = data.get("fallback")
     lines = data["lines"]
 
     try:
@@ -1400,46 +1404,76 @@ def main():
 
     outdir = os.path.join(base, "tts_out")
     os.makedirs(outdir, exist_ok=True)
+    sem = asyncio.Semaphore(CONCURRENT)
 
-    async def one(i, text):
-        fn = os.path.join(outdir, "%03d.mp3" % i)
+    async def one(item, idx, total):
+        h = item["hash"]
+        text = (item.get("text") or "").strip()
+        fn = os.path.join(outdir, h + ".mp3")
+        part = fn + ".part"
+        tag = "[%d/%d]" % (idx + 1, total)
         if os.path.exists(fn) and os.path.getsize(fn) > 1000:
-            print("[%d/%d] ရှိ already - skip" % (i + 1, len(lines)))
+            print("%s ရှိ already - skip" % tag)
             return True
-        text = (text or "").strip()
         if not text:
             return True  # စာသားမရှိ -> အသံမလို
-        voices = [voice] + ([fallback] if fallback and fallback != voice else [])
-        for v in voices:
-            try:
-                await asyncio.wait_for(
-                    edge_tts.Communicate(text, v).save(fn), timeout=60)
-                if os.path.exists(fn) and os.path.getsize(fn) > 1000:
-                    print("[%d/%d] OK" % (i + 1, len(lines)))
-                    return True
-            except Exception as e:
-                print("[%d/%d] %s fail: %s" % (i + 1, len(lines), v,
-                                              type(e).__name__))
+        async with sem:
+            for attempt in range(3):
+                try:
+                    await asyncio.wait_for(
+                        edge_tts.Communicate(text, voice).save(part),
+                        timeout=60)
+                    if os.path.exists(part) and os.path.getsize(part) > 1000:
+                        os.replace(part, fn)  # atomic - တစ်ဝက်ဖိုင်မကျန်
+                        print("%s OK" % tag)
+                        return True
+                    raise IOError("small file")
+                except Exception as e:
+                    if os.path.exists(part):
+                        try:
+                            os.remove(part)
+                        except OSError:
+                            pass
+                    print("%s retry %d: %s" % (tag, attempt + 1,
+                                             type(e).__name__))
+                    await asyncio.sleep(2 * (attempt + 1))
+        print("%s FAIL" % tag)
         return False
 
     async def run():
-        bad = 0
-        for i, text in enumerate(lines):
-            if not await one(i, text):
-                bad += 1
-        return bad
+        results = await asyncio.gather(
+            *[one(item, i, len(lines)) for i, item in enumerate(lines)])
+        return sum(1 for r in results if not r)
 
     bad = asyncio.run(run())
     print("")
     print("ပြီးပြီ - %d/%d အောင်မြင်တယ်" % (len(lines) - bad, len(lines)))
-    if bad:
-        print("%d လိုင်း မရဘူး - ပြန် run ကြည့်" % bad)
-    print("tts_out/ ကို zip လုပ် -> app မှာ တင်")
+
+    # Downloads ထဲ zip အလိုအလျောက်ထုတ်
+    try:
+        import zipfile as zf
+        dl = os.path.expanduser("~/storage/downloads")
+        if os.path.isdir(dl):
+            out_zip = os.path.join(dl, "tts_out.zip")
+            n = 0
+            with zf.ZipFile(out_zip, "w", zf.ZIP_DEFLATED) as z:
+                for item in lines:
+                    fp = os.path.join(outdir, item["hash"] + ".mp3")
+                    if os.path.exists(fp):
+                        z.write(fp, item["hash"] + ".mp3")
+                        n += 1
+            print("zip အဆင်သင့်: %s (%d ခု)" % (out_zip, n))
+        else:
+            print("Downloads မတွေ့ဘူး - tts_out/ ကို ကိုယ်တိုင် zip လုပ်")
+    except Exception as e:
+        print("zip ထုတ်မရဘူး: %s" % e)
+    print("-> app ရဲ့ 'ဖုန်း MP3 zip' မှာ တင်")
 
 
 if __name__ == "__main__":
     main()
 """
+
 
 PHONE_TTS_README = """ဖုန်း TTS လမ်း - လုပ်နည်း
 ========================
@@ -1452,14 +1486,13 @@ Server TTS က Microsoft block ခံထားရလို့ ဒီနည်း
 3. pip install edge-tts
 4. phone_tts.zip ကို ဖြည်ပြီး folder ထဲဝင်
      (ဥပမာ: cd ~/phone_tts)
-5. python tts_phone.py
-   -> tts_out/ ထဲမှာ 000.mp3, 001.mp3 ... ထွက်မယ်
+5. python tts_phone.py   (၄ ခုပြိုင် ထုတ်မယ်)
+   -> tts_out/ ထဲမှာ hash နာမည်နဲ့ MP3 တွေ ထွက်မယ်
    -> ရပ်သွားရင် ပြန် run - ပြီးသားတွေ skip မယ်
-6. tts_out/ folder ကို zip လုပ်
-     (file manager နဲ့ zip လုပ်, ဒါမှမဟုတ် Termux မှာ:
-      pkg install zip -y  &&  zip -r tts_out.zip tts_out)
+6. ပြီးရင် ~/storage/downloads/tts_out.zip အလိုအလျောက် ထွက်မယ်
+   (မထွက်ရင်: zip -r ~/storage/downloads/tts_out.zip tts_out)
 7. Audio Dub Studio -> အဆင့် ၅ -> "ဖုန်းနဲ့ အသံထုတ်မယ်" ဖွင့်
-   -> "ဖုန်း MP3 zip တင်ရန်" ကနေ zip တင်
+   -> "ဖုန်း MP3 zip တင်ရန်" ကနေ tts_out.zip တင်
    -> "ဒီ MP3 တွေနဲ့ ဆက်လုပ်ရန်" နှိပ်
 
 မှတ်ချက်:
@@ -1469,13 +1502,18 @@ Server TTS က Microsoft block ခံထားရလို့ ဒီနည်း
 """
 
 
+def _phone_line_hash(voice, text):
+    """(voice+text) -> 16-hex. စာပြင်ရင် hash ပြောင်း -> အသံမှားမကပ်ဘူး."""
+    return hashlib.sha1((voice + "\n" + (text or "")).encode("utf-8")).hexdigest()[:16]
+
+
 def _build_phone_tts_zip(segments, voice):
     """ဖုန်း TTS အတွက် zip bytes: tts_lines.json + tts_phone.py + README."""
     import io
     import zipfile
-    fb = VOICE_FEMALE if voice == VOICE_MALE else VOICE_MALE
-    payload = {"voice": voice, "fallback": fb,
-               "lines": [(s.get("text") or "") for s in segments]}
+    payload = {"voice": voice,
+               "lines": [{"hash": _phone_line_hash(voice, s.get("text") or ""),
+                          "text": (s.get("text") or "")} for s in segments]}
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr("tts_lines.json",
@@ -1485,8 +1523,10 @@ def _build_phone_tts_zip(segments, voice):
     return buf.getvalue()
 
 
-def _premade_from_zip(zip_file, n_lines, outdir):
-    """ဖုန်း MP3 zip -> [path|None] per line (000.mp3 -> line 0).
+def _premade_from_zip(zip_file, segments, voice, outdir):
+    """ဖုန်း MP3 zip -> [path|None] per line.
+    hash နဲ့ ချိတ် ({hash}.mp3) - စာပြင်လိုက်တဲ့လိုင်း -> None (နေရာလွဲမကပ်ဘူး).
+    hash ဖိုင်မရှိတဲ့ zip အဟောင်း (000.mp3...) ဆို နံပါတ်အတိုင်း ချိတ် (legacy).
     MP3 လုံးဝမတွေ့ရင် None."""
     import zipfile
     if os.path.exists(outdir):
@@ -1497,16 +1537,26 @@ def _premade_from_zip(zip_file, n_lines, outdir):
             z.extractall(outdir)
     except Exception:
         return None
-    found = {}
+    by_hash, by_pos = {}, {}
     for root, _ds, fs in os.walk(outdir):
         for fn in fs:
-            m = re.match(r"^(\d+)\.mp3$", fn, re.IGNORECASE)
-            if m:
-                found[int(m.group(1))] = os.path.join(root, fn)
-    if not found:
+            mh = re.match(r"^([0-9a-f]{16})\.mp3$", fn, re.IGNORECASE)
+            if mh:
+                by_hash[mh.group(1).lower()] = os.path.join(root, fn)
+                continue
+            mp = re.match(r"^(\d+)\.mp3$", fn, re.IGNORECASE)
+            if mp:
+                by_pos[int(mp.group(1))] = os.path.join(root, fn)
+    if not by_hash and not by_pos:
         return None
-    return [(found[i] if (i in found and _valid_audio(found[i])) else None)
-            for i in range(n_lines)]
+    premade = []
+    for i, s in enumerate(segments):
+        if by_hash:
+            p = by_hash.get(_phone_line_hash(voice, s.get("text") or ""))
+        else:
+            p = by_pos.get(i)
+        premade.append(p if (p and _valid_audio(p)) else None)
+    return premade
 
 
 def tts_and_fit(segments, voice, max_speed, work_segs, progress_cb=None, tts_fn=None, premade=None):
@@ -3553,8 +3603,8 @@ def main():
                     # TTS လုံးဝကျရှုံး → step 6 မတက်၊ ရှင်းရှင်းပြ
                     prog.empty(); curlbl.empty()
                     if from_phone:
-                        st.error("⛔ ဖုန်း MP3 တွေနဲ့ အသံထုတ်မရဘူး — zip ထဲ MP3 "
-                                 "တွေ မှန်လား (000.mp3, 001.mp3…) စစ်ပါ.")
+                        st.error("⛔ ဖုန်း MP3 တွေနဲ့ အသံထုတ်မရဘူး — zip ဖိုင် "
+                                 "မှန်လား စစ်ပါ.")
                     else:
                         _errh = report.get("tts_err", "")
                         st.error("⛔ အသံလုံးဝထုတ်မရဘူး — TTS server ကို ဆက်သွယ်မရလို့ပါ." +
@@ -3622,11 +3672,11 @@ def main():
                         st.error("အရင် zip file တင်ပါ.")
                     else:
                         _premade = _premade_from_zip(
-                            _zip_up, len(S.final_segments),
+                            _zip_up, S.final_segments, voice,
                             os.path.join(WORK_DIR, S.run_id, "phone"))
                         if _premade is None:
                             st.error("⛔ zip ထဲ MP3 မတွေ့ဘူး — "
-                                     "000.mp3, 001.mp3… ဆိုတဲ့ နာမည်တွေနဲ့ ဟုတ်လား စစ်ပါ.")
+                                     "tts_out.zip အမှန်ဟုတ်လား စစ်ပါ.")
                         else:
                             _n_ok = sum(1 for p in _premade if p)
                             st.info(f"📥 MP3 {_n_ok}/{len(_premade)} ခု တွေ့တယ် — fit လုပ်နေတယ်…")
