@@ -1289,6 +1289,8 @@ def _parallel_tts_fetch(texts, voice_primary, voice_fallback, tick=None):
     ကျန်တာက alias ပြန်ယူ). ရလဒ်အစဉ်က လိုင်းနံပါတ်အတိုင်း ပြန်စီထားတယ်.
     network/loop ပြဿနာတက်ရင် exception တက် — caller က တကြောင်းချင်းနည်းနဲ့ fallback.
     tick(i, done, total) → လိုင်းတစ်ကြောင်းပြီးတိုင်း (အစဉ်မလိုက်) ခေါ်.
+
+    Returns: (paths, err_hint) — err_hint = ပထမဆုံး failure ရဲ့ type+msg (မရှိရင် "").
     """
     n = len(texts)
     paths = [None] * n
@@ -1310,6 +1312,7 @@ def _parallel_tts_fetch(texts, voice_primary, voice_fallback, tick=None):
         sem = asyncio.Semaphore(3)  # Microsoft throttle ကာကွယ်ဖို့ 6→3
         out = {}
         done = [0]
+        first_err = []
 
         async def _one(i, text):
             async with sem:
@@ -1319,11 +1322,13 @@ def _parallel_tts_fetch(texts, voice_primary, voice_fallback, tick=None):
                         return i, vp
                     for attempt in range(2):
                         try:
-                            await _edge_save(text, v, vp)
+                            # hang မနေစေဖို့ 45s timeout
+                            await asyncio.wait_for(_edge_save(text, v, vp), timeout=45)
                             if _valid_audio(vp):
                                 return i, vp
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            if not first_err:
+                                first_err.append(f"{type(e).__name__}: {str(e)[:150]}")
                         await asyncio.sleep(2.0 * (attempt + 1))
                 return i, None
 
@@ -1334,15 +1339,17 @@ def _parallel_tts_fetch(texts, voice_primary, voice_fallback, tick=None):
             done[0] += 1
             if tick:
                 tick(i, done[0], len(jobs))
-        return out
+        return out, (first_err[0] if first_err else "")
 
+    err_hint = ""
     if jobs:
-        for i, got in asyncio.run(_run()).items():
+        res, err_hint = asyncio.run(_run())
+        for i, got in res.items():
             paths[i] = got
     for i in range(n):
         if isinstance(paths[i], tuple):
             paths[i] = paths[paths[i][1]]
-    return paths
+    return paths, err_hint
 
 
 def tts_and_fit(segments, voice, max_speed, work_segs, progress_cb=None, tts_fn=None):
@@ -1363,23 +1370,26 @@ def tts_and_fit(segments, voice, max_speed, work_segs, progress_cb=None, tts_fn=
     texts = [(s["text"] or "").strip() for s in segments]
 
     src_list = None
+    tts_err = ""
     if tts_fn is tts_segment and n > 0:
         try:
             def _tick(i, done, total):
                 if progress_cb:
                     progress_cb(0.7 * done / max(1, total), i, texts[i][:50])
 
-            src_list = _parallel_tts_fetch(texts, voice, VOICE_FEMALE, tick=_tick)
+            src_list, tts_err = _parallel_tts_fetch(texts, voice, VOICE_FEMALE, tick=_tick)
         except Exception:
             src_list = None  # fallback → အောက်က တကြောင်းချင်းနည်း
 
-    if src_list is not None:
+    if src_list is not None and any(src_list):
         # parallel ကျန်ခဲ့တဲ့ None တွေ → တစ်ကြောင်းချင်း gentle fallback.
         # (အရင် ဒီ fallback က exception တက်မှသာ အလုပ်လုပ်ခဲ့တာ — လိုင်းချင်းပျက်တဲ့
         #  None တွေ ဘယ်တော့မှ ဒီမရောက်ခဲ့ဘူး. အခု comment ရဲ့ ကတိအတိုင်း တကယ်လုပ်.)
+        # any() False (လုံးဝ 0) ဆို systemic failure — sequential လည်း အလကားမို့ ကျော် (fail fast)
         for i in range(n):
             if src_list[i] is None and texts[i].strip():
                 src_list[i] = tts_segment(texts[i], voice, VOICE_FEMALE)
+    report["tts_err"] = tts_err
 
     for i, s in enumerate(segments):
         start, end, text = s["start"], s["end"], texts[i]
@@ -1498,6 +1508,7 @@ def tts_natural(segments, voice, work_segs, progress_cb=None):
 
     async def _fetch(jobs):
         sem = asyncio.Semaphore(3)  # Microsoft throttle ကာကွယ်ဖို့ 6→3
+        first_err = []
 
         async def _one(i, text):
             async with sem:
@@ -1507,11 +1518,13 @@ def tts_natural(segments, voice, work_segs, progress_cb=None):
                         return i, vp
                     for attempt in range(2):
                         try:
-                            await _edge_save(text, v, vp)
+                            # hang မနေစေဖို့ 45s timeout
+                            await asyncio.wait_for(_edge_save(text, v, vp), timeout=45)
                             if _valid_audio(vp):
                                 return i, vp
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            if not first_err:
+                                first_err.append(f"{type(e).__name__}: {str(e)[:150]}")
                         await asyncio.sleep(2.0 * (attempt + 1))
                 return i, None
 
@@ -1521,18 +1534,22 @@ def tts_natural(segments, voice, work_segs, progress_cb=None):
             i, got = await fut
             results.append((i, got))
             _tick(i)
-        return results
+        return results, (first_err[0] if first_err else "")
 
+    tts_err = ""
     if todo:
-        for i, got in asyncio.run(_fetch([(i, t) for i, t, _p in todo])):
-            if got:
-                mp3[i] = got
-        # parallel ကျန်ခဲ့တာတွေ → တစ်ကြောင်းချင်း gentle fallback
-        for i, text, _p in todo:
-            if mp3[i] is None:
-                fp = tts_segment(text, voice, VOICE_FEMALE)
-                if fp:
-                    mp3[i] = fp
+        res, tts_err = asyncio.run(_fetch([(i, t) for i, t, _p in todo]))
+        if any(got for _, got in res):
+            for i, got in res:
+                if got:
+                    mp3[i] = got
+            # parallel ကျန်ခဲ့တာတွေ → တစ်ကြောင်းချင်း gentle fallback
+            for i, text, _p in todo:
+                if mp3[i] is None:
+                    fp = tts_segment(text, voice, VOICE_FEMALE)
+                    if fp:
+                        mp3[i] = fp
+        # လုံးဝ 0 ဆို systemic failure — sequential လည်း အလကားမို့ ကျော် (fail fast)
 
     for i, s in enumerate(segments):
         if i in alias:  # စာသားထပ်နေတာ → ပထမအပိုင်းရဲ့ mp3 ကို ပြန်သုံး
@@ -1543,7 +1560,7 @@ def tts_natural(segments, voice, work_segs, progress_cb=None):
             out.append({"start": float(s.get("start", 0.0)),
                         "end": float(s.get("end", 0.0)),
                         "text": texts[i], "mp3": mp3[i], "dur": dur(mp3[i])})
-    return out, failed
+    return out, failed, tts_err
 
 
 def _video_fps(path):
@@ -2492,13 +2509,14 @@ def _auto_run(S, api_key, groq_key, assembly_key, model_id, voice,
                      f"⏭️ 4/6 — အသံထုတ်ပြီးသား ({len(natural)} ပိုင်း) ကျော်မယ်")
         if natural is None:
             setp(0.54, "🔊 4/6 — မြန်မာအသံထုတ်နေတယ်...")
-            natural, failed_n = tts_natural(
+            natural, failed_n, _nerr = tts_natural(
                 S.final_segments, voice, work_nat,
                 progress_cb=lambda f, i, t: setp(
                     0.54 + 0.20 * f,
                     f"🔊 4/6 — အပိုင်း {i + 1}/{len(S.final_segments)}"))
             if not natural:
-                raise ValueError("အသံထုတ်မရဘူး — network / VPN စစ်ပါ")
+                raise ValueError("အသံထုတ်မရဘူး — network / VPN စစ်ပါ" +
+                                 (f" [{_nerr}]" if _nerr else ""))
             if failed_n:
                 msg.text(f"🔇 အသံထုတ်မရတဲ့အပိုင်း {len(failed_n)} ခု ကျော်သွားမယ်")
             _ckpt_save(rid, "s4_tts",
@@ -3354,8 +3372,10 @@ def main():
                 if not fitted:
                     # TTS လုံးဝကျရှုံး → step 6 မတက်၊ ရှင်းရှင်းပြ
                     prog.empty(); curlbl.empty()
-                    st.error("⛔ အသံလုံးဝထုတ်မရဘူး — TTS server ကို ဆက်သွယ်မရလို့ပါ. "
-                             "Network/VPN စစ်ပြီး \"🔊 အသံထုတ်ရန်\" ပြန်နှိပ်ပါ.")
+                    _errh = report.get("tts_err", "")
+                    st.error("⛔ အသံလုံးဝထုတ်မရဘူး — TTS server ကို ဆက်သွယ်မရလို့ပါ." +
+                             (f" `{_errh}`" if _errh else "") +
+                             " Network/VPN စစ်ပြီး \"🔊 အသံထုတ်ရန်\" ပြန်နှိပ်ပါ.")
                 else:
                     if _nfail5:
                         st.warning(f"🔇 {_nfail5} လိုင်း အသံထုတ်မရဘူး — "
@@ -3418,14 +3438,15 @@ def main():
                             # 🎞️ recap render: သဘာဝအသံထုတ် → video ချိန် → mux
                             work_nat = os.path.join(WORK_DIR, S.run_id, "natural")
                             _pn = st.progress(0.0, "Recap အသံ သဘာဝအတိုင်းထုတ်နေတယ်...")
-                            natural, _failed_n = tts_natural(
+                            natural, _failed_n, _nerr = tts_natural(
                                 S.final_segments, voice, work_nat,
                                 progress_cb=lambda f, i, t: _pn.progress(f))
                             _pn.empty()
                             if not natural:
                                 st.error("⛔ Recap အသံလုံးဝထုတ်မရဘူး — "
-                                         "TTS server ကို ဆက်သွယ်မရလို့ပါ. "
-                                         "Network/VPN စစ်ပြီး \"🎞️ Recap render\" ပြန်နှိပ်ပါ.")
+                                         "TTS server ကို ဆက်သွယ်မရလို့ပါ." +
+                                         (f" `{_nerr}`" if _nerr else "") +
+                                         " Network/VPN စစ်ပြီး \"🎞️ Recap render\" ပြန်နှိပ်ပါ.")
                                 st.stop()
                             if _failed_n:
                                 st.warning(f"🔇 အသံထုတ်မရတဲ့အပိုင်း {len(_failed_n)} ခု "
