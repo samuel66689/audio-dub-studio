@@ -1361,7 +1361,155 @@ def _parallel_tts_fetch(texts, voice_primary, voice_fallback, tick=None):
     return paths, err_hint
 
 
-def tts_and_fit(segments, voice, max_speed, work_segs, progress_cb=None, tts_fn=None):
+# ------------------------------------------------- 📱 ဖုန်း TTS လမ်း
+# Microsoft က server IP ကို block ထားတဲ့အခါ (2026-10-12: 403) —
+# ဖုန်း (Termux, residential IP) နဲ့ edge-tts ထုတ် → MP3 zip ပြန်တင် →
+# server က fit + mix + render ဆက်လုပ် (ffmpeg အပိုင်း အလုပ်ဖြစ်တယ်).
+
+PHONE_TTS_SCRIPT = """#!/usr/bin/env python3
+# Audio Dub Studio - ဖုန်း (Termux) မှာ အသံထုတ်တဲ့ script
+#
+# လုပ်နည်း:
+#   1. Termux ဖွင့် ->  pkg install python -y
+#   2. pip install edge-tts
+#   3. phone_tts.zip ကို ဖြည် -> ဒီ folder ထဲဝင် (cd)
+#   4. python tts_phone.py
+#   5. ပြီးရင် tts_out/ folder ကို zip လုပ် -> app ရဲ့ "ဖုန်း MP3 zip" မှာ တင်
+#
+# ရပ်သွားရင် ပြန် run - ပြီးသား MP3 တွေ skip မယ် (resume ရတယ်).
+
+import asyncio
+import json
+import os
+import sys
+
+
+def main():
+    base = os.path.dirname(os.path.abspath(__file__))
+    with open(os.path.join(base, "tts_lines.json"), encoding="utf-8") as f:
+        data = json.load(f)
+    voice = data["voice"]
+    fallback = data.get("fallback")
+    lines = data["lines"]
+
+    try:
+        import edge_tts
+    except ImportError:
+        print("edge-tts မရှိသေးဘူး - အရင် 'pip install edge-tts' လုပ်")
+        sys.exit(1)
+
+    outdir = os.path.join(base, "tts_out")
+    os.makedirs(outdir, exist_ok=True)
+
+    async def one(i, text):
+        fn = os.path.join(outdir, "%03d.mp3" % i)
+        if os.path.exists(fn) and os.path.getsize(fn) > 1000:
+            print("[%d/%d] ရှိ already - skip" % (i + 1, len(lines)))
+            return True
+        text = (text or "").strip()
+        if not text:
+            return True  # စာသားမရှိ -> အသံမလို
+        voices = [voice] + ([fallback] if fallback and fallback != voice else [])
+        for v in voices:
+            try:
+                await asyncio.wait_for(
+                    edge_tts.Communicate(text, v).save(fn), timeout=60)
+                if os.path.exists(fn) and os.path.getsize(fn) > 1000:
+                    print("[%d/%d] OK" % (i + 1, len(lines)))
+                    return True
+            except Exception as e:
+                print("[%d/%d] %s fail: %s" % (i + 1, len(lines), v,
+                                              type(e).__name__))
+        return False
+
+    async def run():
+        bad = 0
+        for i, text in enumerate(lines):
+            if not await one(i, text):
+                bad += 1
+        return bad
+
+    bad = asyncio.run(run())
+    print("")
+    print("ပြီးပြီ - %d/%d အောင်မြင်တယ်" % (len(lines) - bad, len(lines)))
+    if bad:
+        print("%d လိုင်း မရဘူး - ပြန် run ကြည့်" % bad)
+    print("tts_out/ ကို zip လုပ် -> app မှာ တင်")
+
+
+if __name__ == "__main__":
+    main()
+"""
+
+PHONE_TTS_README = """ဖုန်း TTS လမ်း - လုပ်နည်း
+========================
+
+Server TTS က Microsoft block ခံထားရလို့ ဒီနည်းနဲ့ ဖုန်းကနေ အသံထုတ်မယ်.
+အသံက app က voice အတိုင်းပဲ (Thiha/Nilar).
+
+1. Termux app ဖွင့်
+2. pkg install python -y
+3. pip install edge-tts
+4. phone_tts.zip ကို ဖြည်ပြီး folder ထဲဝင်
+     (ဥပမာ: cd ~/phone_tts)
+5. python tts_phone.py
+   -> tts_out/ ထဲမှာ 000.mp3, 001.mp3 ... ထွက်မယ်
+   -> ရပ်သွားရင် ပြန် run - ပြီးသားတွေ skip မယ်
+6. tts_out/ folder ကို zip လုပ်
+     (file manager နဲ့ zip လုပ်, ဒါမှမဟုတ် Termux မှာ:
+      pkg install zip -y  &&  zip -r tts_out.zip tts_out)
+7. Audio Dub Studio -> အဆင့် ၅ -> "ဖုန်းနဲ့ အသံထုတ်မယ်" ဖွင့်
+   -> "ဖုန်း MP3 zip တင်ရန်" ကနေ zip တင်
+   -> "ဒီ MP3 တွေနဲ့ ဆက်လုပ်ရန်" နှိပ်
+
+မှတ်ချက်:
+- WiFi/4G ဖွင့်ထားပါ
+- Termux ကို screen ပိတ်ရင် ရပ်သွားနိုင်တယ် -
+  screen မပိတ်အောင် ထားတာ အကောင်းဆုံး
+"""
+
+
+def _build_phone_tts_zip(segments, voice):
+    """ဖုန်း TTS အတွက် zip bytes: tts_lines.json + tts_phone.py + README."""
+    import io
+    import zipfile
+    fb = VOICE_FEMALE if voice == VOICE_MALE else VOICE_MALE
+    payload = {"voice": voice, "fallback": fb,
+               "lines": [(s.get("text") or "") for s in segments]}
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("tts_lines.json",
+                   json.dumps(payload, ensure_ascii=False, indent=1))
+        z.writestr("tts_phone.py", PHONE_TTS_SCRIPT)
+        z.writestr("README_ဖတ်ရန်.txt", PHONE_TTS_README)
+    return buf.getvalue()
+
+
+def _premade_from_zip(zip_file, n_lines, outdir):
+    """ဖုန်း MP3 zip -> [path|None] per line (000.mp3 -> line 0).
+    MP3 လုံးဝမတွေ့ရင် None."""
+    import zipfile
+    if os.path.exists(outdir):
+        shutil.rmtree(outdir)
+    os.makedirs(outdir, exist_ok=True)
+    try:
+        with zipfile.ZipFile(zip_file) as z:
+            z.extractall(outdir)
+    except Exception:
+        return None
+    found = {}
+    for root, _ds, fs in os.walk(outdir):
+        for fn in fs:
+            m = re.match(r"^(\d+)\.mp3$", fn, re.IGNORECASE)
+            if m:
+                found[int(m.group(1))] = os.path.join(root, fn)
+    if not found:
+        return None
+    return [(found[i] if (i in found and _valid_audio(found[i])) else None)
+            for i in range(n_lines)]
+
+
+def tts_and_fit(segments, voice, max_speed, work_segs, progress_cb=None, tts_fn=None, premade=None):
     """segments: [{'start','end','text'}] → fitted mp3 တွေ.
 
     TTS_CONCURRENT=True ဆို: network အပိုင်းကို 3 ပြိုင်နက်ထုတ် (retry+backoff ပါ) →
@@ -1369,6 +1517,9 @@ def tts_and_fit(segments, voice, max_speed, work_segs, progress_cb=None, tts_fn=
     TTS_CONCURRENT=False (လက်ရှိ) ဆို: တစ်ကြောင်းချင်း sequential — သက်သေပြ reliable.
     ပြီးမှ တကြောင်းချင်း duration တိုင်း + slot ထဲချိန် (sync logic လုံးဝမထိဘူး).
     parallel ပျက်ရင် တကြောင်းချင်းနည်းနဲ့ အလိုအလျောက်ပြန်လုပ်.
+
+    premade: 📱 ဖုန်း TTS လမ်း — [path|None] per line ပေးရင် server TTS လုံးဝကျော်,
+             ဒီ MP3 တွေကို တိုက်ရိုက် fit လုပ် (None = အဲ့လိုင်း အသံမရှိ).
 
     Returns: (fitted=[(start, seg_path, played)], report={natural, sped,
              overflow:[...], tts_failed:[...]})
@@ -1379,9 +1530,13 @@ def tts_and_fit(segments, voice, max_speed, work_segs, progress_cb=None, tts_fn=
     n = len(segments)
     texts = [(s["text"] or "").strip() for s in segments]
 
-    src_list = None
+    from_phone = premade is not None
+    if from_phone:
+        src_list = (list(premade) + [None] * n)[:n]
+    else:
+        src_list = None
     tts_err = ""
-    if TTS_CONCURRENT and tts_fn is tts_segment and n > 0:
+    if not from_phone and TTS_CONCURRENT and tts_fn is tts_segment and n > 0:
         try:
             def _tick(i, done, total):
                 if progress_cb:
@@ -1391,7 +1546,7 @@ def tts_and_fit(segments, voice, max_speed, work_segs, progress_cb=None, tts_fn=
         except Exception:
             src_list = None  # fallback → အောက်က တကြောင်းချင်းနည်း
 
-    if src_list is not None and any(src_list):
+    if not from_phone and src_list is not None and any(src_list):
         # parallel ကျန်ခဲ့တဲ့ None တွေ → တစ်ကြောင်းချင်း gentle fallback.
         # (အရင် ဒီ fallback က exception တက်မှသာ အလုပ်လုပ်ခဲ့တာ — လိုင်းချင်းပျက်တဲ့
         #  None တွေ ဘယ်တော့မှ ဒီမရောက်ခဲ့ဘူး. အခု comment ရဲ့ ကတိအတိုင်း တကယ်လုပ်.)
@@ -1426,7 +1581,7 @@ def tts_and_fit(segments, voice, max_speed, work_segs, progress_cb=None, tts_fn=
             else:
                 report["sped"] += 1
         if progress_cb:
-            base = 0.7 if src_list is not None else 0.0
+            base = 0.0 if from_phone else (0.7 if src_list is not None else 0.0)
             progress_cb(base + (1.0 - base) * (i + 1) / n, i, text[:50])
     if not tts_err and _seq_errs:
         report["tts_err"] = _seq_errs[0]
@@ -3380,11 +3535,9 @@ def main():
         else:
             st.caption("အသံတစ်ကြောင်းချင်းကို သူ့အချိန်ကွက်ထဲ အတိအကျထည့်မယ် — "
                        f"ရှည်ရင် {max_speed}x အထိ မြန်ပေးမယ်၊ နောက်အပိုင်းနဲ့ ဘယ်တော့မှ မထပ်စေဘူး။")
-            _bc5, _ = st.columns([1, 2])
-            with _bc5:
-                _go5 = st.button("🔊 အသံထုတ်ရန်", type="primary",
-                                 use_container_width=True)
-            if _go5:
+            def _run_step5_fit(premade=None):
+                """premade=None → server TTS; premade=[path|None] → ဖုန်း MP3."""
+                from_phone = premade is not None
                 work_segs = os.path.join(WORK_DIR, S.run_id, "segs")
                 prog = st.progress(0.0)
                 curlbl = st.empty()
@@ -3393,21 +3546,27 @@ def main():
                     curlbl.text(f"အပိုင်း {i + 1}/{len(S.final_segments)}: {t}")
                 S.auto_shortened = False
                 fitted, report = tts_and_fit(S.final_segments, voice, max_speed,
-                                             work_segs, progress_cb=cb)
+                                             work_segs, progress_cb=cb,
+                                             premade=premade)
                 _nfail5 = len(report.get("tts_failed", []))
                 if not fitted:
                     # TTS လုံးဝကျရှုံး → step 6 မတက်၊ ရှင်းရှင်းပြ
                     prog.empty(); curlbl.empty()
-                    _errh = report.get("tts_err", "")
-                    st.error("⛔ အသံလုံးဝထုတ်မရဘူး — TTS server ကို ဆက်သွယ်မရလို့ပါ." +
-                             (f" `{_errh}`" if _errh else "") +
-                             " Network/VPN စစ်ပြီး \"🔊 အသံထုတ်ရန်\" ပြန်နှိပ်ပါ.")
+                    if from_phone:
+                        st.error("⛔ ဖုန်း MP3 တွေနဲ့ အသံထုတ်မရဘူး — zip ထဲ MP3 "
+                                 "တွေ မှန်လား (000.mp3, 001.mp3…) စစ်ပါ.")
+                    else:
+                        _errh = report.get("tts_err", "")
+                        st.error("⛔ အသံလုံးဝထုတ်မရဘူး — TTS server ကို ဆက်သွယ်မရလို့ပါ." +
+                                 (f" `{_errh}`" if _errh else "") +
+                                 " Network/VPN စစ်ပြီး \"🔊 အသံထုတ်ရန်\" ပြန်နှိပ်ပါ.")
                 else:
                     if _nfail5:
                         st.warning(f"🔇 {_nfail5} လိုင်း အသံထုတ်မရဘူး — "
                                    "အဲ့လိုင်းတွေ ကျော်သွားမယ်.")
                     # စာရှည်လို့ အချိန်ကွက်ထဲ မဝင်တဲ့လိုင်းတွေ → Gemini နဲ့ အလိုအလျောက်တိုပေး
-                    if auto_shorten and report["overflow"] and api_key:
+                    # (ဖုန်းလမ်းဆို server TTS ပြန်ခေါ်မရလို့ ကျော် — step 4 မှာ ကိုယ်တိုင်တိုထား)
+                    if (not from_phone) and auto_shorten and report["overflow"] and api_key:
                         items = [{"id": i, "text": t,
                                   "target_chars": max(4, int(len(t) / ratio * 1.15))}
                                  for (i, _s, _e, t, ratio) in report["overflow"]]
@@ -3437,6 +3596,41 @@ def main():
                     S["wizard_step"] = 6
                     _manual_ckpt_save(S, is_video)
                     st.rerun()
+
+            _bc5, _ = st.columns([1, 2])
+            with _bc5:
+                _go5 = st.button("🔊 အသံထုတ်ရန်", type="primary",
+                                 use_container_width=True)
+            if _go5:
+                _run_step5_fit()
+
+            with st.expander("📱 ဖုန်းနဲ့ အသံထုတ်မယ် (server TTS မရတဲ့အခါ)"):
+                st.caption("Microsoft က server ကို block ထားလို့ အသံထုတ်မရတဲ့အခါ — "
+                           "ဖုန်း (Termux) နဲ့ အသံထုတ် → MP3 zip ပြန်တင်. "
+                           "အသံက ဒီ voice အတိုင်းပဲ.")
+                st.download_button("📤 စာသား + script ဒေါင်းရန်",
+                                   data=_build_phone_tts_zip(S.final_segments, voice),
+                                   file_name="phone_tts.zip",
+                                   mime="application/zip",
+                                   use_container_width=True)
+                _zip_up = st.file_uploader("📥 ဖုန်းက MP3 zip တင်ရန်",
+                                           type=["zip"], key="phone_tts_zip")
+                _go_phone = st.button("🔧 ဒီ MP3 တွေနဲ့ ဆက်လုပ်ရန်",
+                                      type="primary", use_container_width=True)
+                if _go_phone:
+                    if _zip_up is None:
+                        st.error("အရင် zip file တင်ပါ.")
+                    else:
+                        _premade = _premade_from_zip(
+                            _zip_up, len(S.final_segments),
+                            os.path.join(WORK_DIR, S.run_id, "phone"))
+                        if _premade is None:
+                            st.error("⛔ zip ထဲ MP3 မတွေ့ဘူး — "
+                                     "000.mp3, 001.mp3… ဆိုတဲ့ နာမည်တွေနဲ့ ဟုတ်လား စစ်ပါ.")
+                        else:
+                            _n_ok = sum(1 for p in _premade if p)
+                            st.info(f"📥 MP3 {_n_ok}/{len(_premade)} ခု တွေ့တယ် — fit လုပ်နေတယ်…")
+                            _run_step5_fit(premade=_premade)
         _spidey_card_close()
 
     if S["wizard_step"] == 6:
