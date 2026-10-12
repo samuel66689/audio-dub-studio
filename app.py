@@ -3321,36 +3321,47 @@ def main():
                 S.auto_shortened = False
                 fitted, report = tts_and_fit(S.final_segments, voice, max_speed,
                                              work_segs, progress_cb=cb)
-                # စာရှည်လို့ အချိန်ကွက်ထဲ မဝင်တဲ့လိုင်းတွေ → Gemini နဲ့ အလိုအလျောက်တိုပေး
-                if auto_shorten and report["overflow"] and api_key:
-                    items = [{"id": i, "text": t,
-                              "target_chars": max(4, int(len(t) / ratio * 1.15))}
-                             for (i, _s, _e, t, ratio) in report["overflow"]]
-                    with st.status("✂️ Gemini နဲ့ စာရှည်တဲ့လိုင်းတွေ တိုအောင်ပြင်နေတယ်...",
-                                   expanded=False):
-                        short = gemini_shorten(api_key,
-                                               model_id.strip() or GEMINI_MODEL_DEFAULT,
-                                               items, glossary=glossary)
-                    applied = 0
-                    for (i, _s, _e, t, _r) in report["overflow"]:
-                        if i in short and short[i] != t:
-                            S.final_segments[i]["text"] = short[i]
-                            applied += 1
-                    if applied:
-                        # တိုထားတဲ့စာသားနဲ့ အသံပြန်ထုတ် (တစ်ကြိမ်သာ — cache ကြောင့်
-                        # မပြောင်းတဲ့လိုင်းတွေ အသံပြန်ထုတ်စရာ မလိုဘူး)
-                        fitted, report = tts_and_fit(S.final_segments, voice, max_speed,
-                                                     work_segs, progress_cb=cb)
-                        S.auto_shortened = True
-                        st.info(f"✂️ Gemini က {applied} လိုင်း တိုအောင်ပြင်ပြီးပြီ — "
-                                "အသံပြန်ထုတ်ထားတယ်")
-                S.fitted, S.fit_report, S.out_mp4, S.out_mp3 = fitted, report, None, None
-                S.recap_timeline, S.recap_report, S.out_subs = None, None, None
-                prog.empty(); curlbl.empty()
-                st.toast(f"✅ အပိုင်း {len(fitted)} ပိုင်း အသံထွက်ပြီးပြီ")
-                S["wizard_step"] = 6
-                _manual_ckpt_save(S, is_video)
-                st.rerun()
+                _nfail5 = len(report.get("tts_failed", []))
+                if not fitted:
+                    # TTS လုံးဝကျရှုံး → step 6 မတက်၊ ရှင်းရှင်းပြ
+                    prog.empty(); curlbl.empty()
+                    st.error("⛔ အသံလုံးဝထုတ်မရဘူး — TTS server ကို ဆက်သွယ်မရလို့ပါ. "
+                             "Network/VPN စစ်ပြီး \"🔊 အသံထုတ်ရန်\" ပြန်နှိပ်ပါ.")
+                else:
+                    if _nfail5:
+                        st.warning(f"🔇 {_nfail5} လိုင်း အသံထုတ်မရဘူး — "
+                                   "အဲ့လိုင်းတွေ ကျော်သွားမယ်.")
+                    # စာရှည်လို့ အချိန်ကွက်ထဲ မဝင်တဲ့လိုင်းတွေ → Gemini နဲ့ အလိုအလျောက်တိုပေး
+                    if auto_shorten and report["overflow"] and api_key:
+                        items = [{"id": i, "text": t,
+                                  "target_chars": max(4, int(len(t) / ratio * 1.15))}
+                                 for (i, _s, _e, t, ratio) in report["overflow"]]
+                        with st.status("✂️ Gemini နဲ့ စာရှည်တဲ့လိုင်းတွေ တိုအောင်ပြင်နေတယ်...",
+                                       expanded=False):
+                            short = gemini_shorten(api_key,
+                                                   model_id.strip() or GEMINI_MODEL_DEFAULT,
+                                                   items, glossary=glossary)
+                        applied = 0
+                        for (i, _s, _e, t, _r) in report["overflow"]:
+                            if i in short and short[i] != t:
+                                S.final_segments[i]["text"] = short[i]
+                                applied += 1
+                        if applied:
+                            # တိုထားတဲ့စာသားနဲ့ အသံပြန်ထုတ် (တစ်ကြိမ်သာ — cache ကြောင့်
+                            # မပြောင်းတဲ့လိုင်းတွေ အသံပြန်ထုတ်စရာ မလိုဘူး)
+                            fitted, report = tts_and_fit(S.final_segments, voice, max_speed,
+                                                         work_segs, progress_cb=cb)
+                            S.auto_shortened = True
+                            st.info(f"✂️ Gemini က {applied} လိုင်း တိုအောင်ပြင်ပြီးပြီ — "
+                                    "အသံပြန်ထုတ်ထားတယ်")
+                    S.fitted, S.fit_report, S.out_mp4, S.out_mp3 = fitted, report, None, None
+                    S.recap_timeline, S.recap_report, S.out_subs = None, None, None
+                    prog.empty(); curlbl.empty()
+                    st.toast(f"✅ အပိုင်း {len(fitted)} ပိုင်း အသံထွက်ပြီးပြီ" +
+                             (f" ({_nfail5} လိုင်း ကျော်)" if _nfail5 else ""))
+                    S["wizard_step"] = 6
+                    _manual_ckpt_save(S, is_video)
+                    st.rerun()
         _spidey_card_close()
 
     if S["wizard_step"] == 6:
@@ -3382,6 +3393,11 @@ def main():
                                 S.final_segments, voice, work_nat,
                                 progress_cb=lambda f, i, t: _pn.progress(f))
                             _pn.empty()
+                            if not natural:
+                                st.error("⛔ Recap အသံလုံးဝထုတ်မရဘူး — "
+                                         "TTS server ကို ဆက်သွယ်မရလို့ပါ. "
+                                         "Network/VPN စစ်ပြီး \"🎞️ Recap render\" ပြန်နှိပ်ပါ.")
+                                st.stop()
                             if _failed_n:
                                 st.warning(f"🔇 အသံထုတ်မရတဲ့အပိုင်း {len(_failed_n)} ခု "
                                            "ကျော်သွားမယ်")
