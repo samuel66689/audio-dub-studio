@@ -276,6 +276,10 @@ TTS_CONCURRENT = False
 _RELAY_URL = ""
 _RELAY_TOKEN = ""
 
+def _tts_use_concurrent():
+    """relay (phone IP, clean) so 3-concurrent; mahout yin TTS_CONCURRENT."""
+    return TTS_CONCURRENT or bool(_RELAY_URL)
+
 
 # ------------------------------------------------------------------ helpers
 def run(cmd):
@@ -621,6 +625,12 @@ def _gemini_call(api_key, model_id, system_text, payload_text):
         "contents": [{"role": "user", "parts": [{"text": payload_text}]}],
         "generationConfig": {"responseMimeType": "application/json",
                              "temperature": 0.3, "maxOutputTokens": 8192},
+        "safetySettings": [
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_ONLY_HIGH"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_ONLY_HIGH"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_ONLY_HIGH"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_ONLY_HIGH"},
+        ],
     }
     headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
     last_err, retry_after = None, 0.0
@@ -1741,7 +1751,7 @@ def tts_and_fit(segments, voice, max_speed, work_segs, progress_cb=None, tts_fn=
     else:
         src_list = None
     tts_err = ""
-    if not from_phone and TTS_CONCURRENT and tts_fn is tts_segment and n > 0:
+    if not from_phone and _tts_use_concurrent() and tts_fn is tts_segment and n > 0:
         try:
             def _tick(i, done, total):
                 if progress_cb:
@@ -1913,7 +1923,7 @@ def tts_natural(segments, voice, work_segs, progress_cb=None):
 
     tts_err = ""
     if todo:
-        if TTS_CONCURRENT:
+        if _tts_use_concurrent():
             res, tts_err = asyncio.run(_fetch([(i, t) for i, t, _p in todo]))
             if any(got for _, got in res):
                 for i, got in res:
