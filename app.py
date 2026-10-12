@@ -266,6 +266,11 @@ GEMINI_MODEL_DEFAULT = "gemini-3.5-flash-lite"   # Script-writer / sub-translato
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models/"
 VOICE_MALE = "my-MM-ThihaNeural"
 VOICE_FEMALE = "my-MM-NilarNeural"
+# TTS concurrency switch — 2026-10-12: 6-parallel (နောက် 3-parallel) သုံးပြီးတဲ့နောက်
+# Microsoft က throttle/block လုပ်သွားပုံရတယ် → TTS လုံးဝပျက်သွားတယ်.
+# သက်သေပြ sequential (False) ကို ပြန်ထားတယ်. True ပြန်လုပ်မယ်ဆိုရင်
+# Microsoft ဘက်က concurrent traffic လက်ခံတာ အတည်ပြုပြီးမှသာ.
+TTS_CONCURRENT = False
 
 
 # ------------------------------------------------------------------ helpers
@@ -1232,21 +1237,25 @@ def _tts_cache_path(text, voice_primary):
     return os.path.join(CACHE_TTS, f"{key}.mp3")
 
 
-def tts_segment(text, voice_primary=VOICE_MALE, voice_fallback=VOICE_FEMALE):
+def tts_segment(text, voice_primary=VOICE_MALE, voice_fallback=VOICE_FEMALE, err_out=None):
     """စာတစ်ကြောင်းကို TTS mp3 ထုတ် (cache ပါ). မရရင် None.
 
     မှတ်ချက်: ဒီစက်ရဲ့ network က Microsoft TTS ကို ပိတ်ထားလို့ ဒီမှာစမ်းရင်
     ပျက်မယ် — အဲ့တာ bug မဟုတ်ဘူး၊ user စက်မှာ အလုပ်လုပ်တယ်။
+    voice အမှန်နဲ့ cache key — fallback audio ကို primary key အောက် မှားမသိမ်းဘူး.
+    err_out (list) ပေးရင် ပထမဆုံး error ရဲ့ type+msg ကို ထည့်ပေးမယ် (diagnostics).
     """
-    out = _tts_cache_path(text, voice_primary)
-    if _valid_audio(out):
-        return out
     for voice in (voice_primary, voice_fallback):
+        out = _tts_cache_path(text, voice)
+        if _valid_audio(out):
+            return out
         try:
-            asyncio.run(_edge_save(text, voice, out))
+            asyncio.run(asyncio.wait_for(_edge_save(text, voice, out), timeout=45))
             if _valid_audio(out):
                 return out
-        except Exception:
+        except Exception as e:
+            if err_out is not None and not err_out:
+                err_out.append(f"{type(e).__name__}: {str(e)[:150]}")
             continue
     return None
 
@@ -1355,9 +1364,10 @@ def _parallel_tts_fetch(texts, voice_primary, voice_fallback, tick=None):
 def tts_and_fit(segments, voice, max_speed, work_segs, progress_cb=None, tts_fn=None):
     """segments: [{'start','end','text'}] → fitted mp3 တွေ.
 
-    အသံထုတ်တဲ့ (network) အပိုင်းကို 3 ပြိုင်နက်ထုတ် (retry+backoff ပါ) →
-    ကျန်တဲ့ None တွေ တစ်ကြောင်းချင်း fallback → ပြီးမှ တကြောင်းချင်း
-    duration တိုင်း + slot ထဲချိန် (အရင်အတိုင်း — sync logic လုံးဝမထိဘူး).
+    TTS_CONCURRENT=True ဆို: network အပိုင်းကို 3 ပြိုင်နက်ထုတ် (retry+backoff ပါ) →
+    ကျန်တဲ့ None တွေ တစ်ကြောင်းချင်း fallback.
+    TTS_CONCURRENT=False (လက်ရှိ) ဆို: တစ်ကြောင်းချင်း sequential — သက်သေပြ reliable.
+    ပြီးမှ တကြောင်းချင်း duration တိုင်း + slot ထဲချိန် (sync logic လုံးဝမထိဘူး).
     parallel ပျက်ရင် တကြောင်းချင်းနည်းနဲ့ အလိုအလျောက်ပြန်လုပ်.
 
     Returns: (fitted=[(start, seg_path, played)], report={natural, sped,
@@ -1371,7 +1381,7 @@ def tts_and_fit(segments, voice, max_speed, work_segs, progress_cb=None, tts_fn=
 
     src_list = None
     tts_err = ""
-    if tts_fn is tts_segment and n > 0:
+    if TTS_CONCURRENT and tts_fn is tts_segment and n > 0:
         try:
             def _tick(i, done, total):
                 if progress_cb:
@@ -1389,6 +1399,7 @@ def tts_and_fit(segments, voice, max_speed, work_segs, progress_cb=None, tts_fn=
         for i in range(n):
             if src_list[i] is None and texts[i].strip():
                 src_list[i] = tts_segment(texts[i], voice, VOICE_FEMALE)
+    _seq_errs = []
     report["tts_err"] = tts_err
 
     for i, s in enumerate(segments):
@@ -1398,8 +1409,10 @@ def tts_and_fit(segments, voice, max_speed, work_segs, progress_cb=None, tts_fn=
         gap_after = max(0.0, next_start - end)
         if src_list is not None:
             src = src_list[i]
+        elif tts_fn is tts_segment:
+            src = tts_fn(text, voice, VOICE_FEMALE, err_out=_seq_errs)
         else:
-            src = tts_fn(text, voice, VOICE_FEMALE) if tts_fn is tts_segment else tts_fn(text)
+            src = tts_fn(text)
         if src is None:
             report["tts_failed"].append((i, start, text[:60]))
         else:
@@ -1415,6 +1428,8 @@ def tts_and_fit(segments, voice, max_speed, work_segs, progress_cb=None, tts_fn=
         if progress_cb:
             base = 0.7 if src_list is not None else 0.0
             progress_cb(base + (1.0 - base) * (i + 1) / n, i, text[:50])
+    if not tts_err and _seq_errs:
+        report["tts_err"] = _seq_errs[0]
     return fitted, report
 
 
@@ -1538,18 +1553,29 @@ def tts_natural(segments, voice, work_segs, progress_cb=None):
 
     tts_err = ""
     if todo:
-        res, tts_err = asyncio.run(_fetch([(i, t) for i, t, _p in todo]))
-        if any(got for _, got in res):
-            for i, got in res:
+        if TTS_CONCURRENT:
+            res, tts_err = asyncio.run(_fetch([(i, t) for i, t, _p in todo]))
+            if any(got for _, got in res):
+                for i, got in res:
+                    if got:
+                        mp3[i] = got
+                # parallel ကျန်ခဲ့တာတွေ → တစ်ကြောင်းချင်း gentle fallback
+                for i, text, _p in todo:
+                    if mp3[i] is None:
+                        fp = tts_segment(text, voice, VOICE_FEMALE)
+                        if fp:
+                            mp3[i] = fp
+            # လုံးဝ 0 ဆို systemic failure — sequential လည်း အလကားမို့ ကျော် (fail fast)
+        else:
+            # sequential, တစ်ကြောင်းချင်း — သက်သေပြ reliable လမ်း
+            _serrs = []
+            for i, text, _p in todo:
+                got = tts_segment(text, voice, VOICE_FEMALE, err_out=_serrs)
                 if got:
                     mp3[i] = got
-            # parallel ကျန်ခဲ့တာတွေ → တစ်ကြောင်းချင်း gentle fallback
-            for i, text, _p in todo:
-                if mp3[i] is None:
-                    fp = tts_segment(text, voice, VOICE_FEMALE)
-                    if fp:
-                        mp3[i] = fp
-        # လုံးဝ 0 ဆို systemic failure — sequential လည်း အလကားမို့ ကျော် (fail fast)
+                _tick(i)
+            if _serrs:
+                tts_err = _serrs[0]
 
     for i, s in enumerate(segments):
         if i in alias:  # စာသားထပ်နေတာ → ပထမအပိုင်းရဲ့ mp3 ကို ပြန်သုံး
