@@ -1252,6 +1252,13 @@ def _sync_relay_config():
         pass
 
 
+def _set_relay_globals(url, token):
+    """relay URL/token → module globals (for _edge_save)."""
+    global _RELAY_URL, _RELAY_TOKEN
+    _RELAY_URL = (url or "").strip().rstrip("/")
+    _RELAY_TOKEN = (token or "").strip()
+
+
 async def _edge_save(text, voice, path):
     """edge-tts → tmp .part မှာ ရေး → size စစ် → ပြီးမှ cache path ကို replace.
 
@@ -3809,8 +3816,6 @@ def main():
             with _bc5:
                 _go5 = st.button("🔊 အသံထုတ်ရန်", type="primary",
                                  use_container_width=True)
-            if _go5:
-                _run_step5_fit()
 
             with st.expander("📱 ဖုန်းနဲ့ အသံထုတ်မယ် (server TTS မရတဲ့အခါ)"):
                 st.caption("Microsoft က server ကို block ထားလို့ အသံထုတ်မရတဲ့အခါ — "
@@ -3829,9 +3834,9 @@ def main():
                                        key="relay_url")
                 _rt_in = st.text_input("Relay token", type="password",
                                        key="relay_token")
+                _set_relay_globals(_ru_in, _rt_in)  # widget value → _edge_save
                 _test_relay = st.button("🔌 Relay စမ်းရန်", use_container_width=True)
                 if _test_relay:
-                    _sync_relay_config()
                     if not _RELAY_URL:
                         st.error("URL ထည့်ပါ.")
                     else:
@@ -3871,6 +3876,11 @@ def main():
                             _n_ok = sum(1 for p in _premade if p)
                             st.info(f"📥 MP3 {_n_ok}/{len(_premade)} ခု တွေ့တယ် — fit လုပ်နေတယ်…")
                             _run_step5_fit(premade=_premade)
+
+            # 🔊 TTS button handler — expander နောက် (relay widget values ရပြီး)
+            if _go5:
+                _run_step5_fit()
+
         _spidey_card_close()
 
     if S["wizard_step"] == 6:
