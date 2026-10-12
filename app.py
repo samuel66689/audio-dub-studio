@@ -3658,6 +3658,12 @@ def main():
                 st.caption("Microsoft က server ကို block ထားလို့ အသံထုတ်မရတဲ့အခါ — "
                            "ဖုန်း (Termux) နဲ့ အသံထုတ် → MP3 zip ပြန်တင်. "
                            "အသံက ဒီ voice အတိုင်းပဲ.")
+                try:
+                    import importlib.metadata as _ilm
+                    _ettv = _ilm.version("edge-tts")
+                except Exception:
+                    _ettv = "?"
+                st.caption(f"🔧 server edge-tts version: `{_ettv}`")
                 st.download_button("📤 စာသား + script ဒေါင်းရန်",
                                    data=_build_phone_tts_zip(S.final_segments, voice),
                                    file_name="phone_tts.zip",
