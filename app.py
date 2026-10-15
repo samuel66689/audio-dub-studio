@@ -1785,6 +1785,15 @@ def tts_and_fit(segments, voice, max_speed, work_segs, progress_cb=None, tts_fn=
             src = tts_fn(text)
         if src is None:
             report["tts_failed"].append((i, start, text[:60]))
+            # FAIL-FAST (2026-10-15): server 403 (Microsoft block) — ပထမလိုင်းမှာတင်�ပ်.
+            # 403 က retry နဲ့ဘယ်တော့မှပြန်မကောင်းဘူး — ကျန်လိုင်းတွေ x voice ၂ မျိုး
+            # ဆက်ထုနေတာ အချိန်ပုပ်သက်သက်. relay/ဖုန်း လမ်းနဲ့ တခြား error တွေက ပုံမှန်အတိုင်း ဆက်.
+            if (not from_phone and not _RELAY_URL and tts_fn is tts_segment and _seq_errs
+                    and any(k in _seq_errs[0] for k in ("403", "WSServerHandshakeError", "Invalid response status"))):
+                report["tts_err"] = _seq_errs[0]
+                if progress_cb:
+                    progress_cb(1.0, i, text[:50])
+                break
         else:
             seg_path = os.path.join(work_segs, f"s{i:04d}.mp3")
             played, note, ratio = fit_segment(src, slot, gap_after, max_speed, seg_path)
