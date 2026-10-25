@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  body { font-family: sans-serif; margin: 0; padding: 8px; color: #ddd; background: transparent; }
+  #bar-wrap { background: #333; border-radius: 8px; height: 18px; overflow: hidden; }
+  #bar { background: #4caf50; height: 100%; width: 0%; transition: width .3s; }
+  #msg { margin-top: 6px; font-size: 14px; }
+  #err { margin-top: 6px; font-size: 13px; color: #ff8a80; white-space: pre-wrap; }
+  button { margin-top: 8px; padding: 6px 14px; border-radius: 8px; border: none; background: #4caf50; color: #fff; cursor: pointer; }
+</style>
+</head>
+<body>
+<div id="ui">
+  <div id="bar-wrap"><div id="bar"></div></div>
+  <div id="msg">Browser TTS အဆင်သင့်…</div>
+  <div id="err"></div>
+</div>
+<script>
+(function () {
+  const TRUSTED = "6A5AA1D4EAFF4E9FB9E31F416A9C73B4";
+  const GEC_VER = "1-143.0.3650.75";
+  const $ = (id) => document.getElementById(id);
+  let startedJob = null;
+  let args = null;
+
+  function send(type, payload) {
+    window.parent.postMessage(Object.assign({ type: type }, payload || {}), "*");
+  }
+  function setHeight() {
+    send("streamlit:setFrameHeight", { height: document.body.scrollHeight + 10 });
+  }
+  function setMsg(m) { $("msg").textContent = m; setHeight(); }
+  function setErr(m) { $("err").textContent = m; setHeight(); }
+  function setBar(f) { $("bar").style.width = Math.round(f * 100) + "%"; }
+
+  function uuid() {
+    return ([1e7] + -1e3 + -4e3 + -8e3 + -1e11).replace(/[018]/g, c =>
+      (c ^ crypto.getRandomValues(new Uint8Array(1))[0] & 15 >> c / 4).toString(16));
+  }
+  function dateStr() {
+    return new Date().toUTCString().replace(/GMT/, "GMT+0000 (Coordinated Universal Time)");
+  }
+  async function secMsGec() {
+    let ticks = Math.floor(Date.now() / 1000) + 11644473600;
+    ticks -= ticks % 300;
+    ticks = ticks * 10000000;
+    const s = String(ticks) + TRUSTED;
+    const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
+    return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join("").toUpperCase();
+  }
+  function escXml(t) {
+    return t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+  function bufToB64(buf) {
+    const bytes = new Uint8Array(buf);
+    let bin = "";
+    const CH = 0x8000;
+    for (let i = 0; i < bytes.length; i += CH) {
+      bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CH));
+    }
+    return btoa(bin);
+  }
+
+  function ttsOne(text, voice) {
+    return new Promise(async (resolve, reject) => {
+      let gec;
+      try { gec = await secMsGec(); }
+      catch (e) { reject(new Error("SHA256 မရဘူး: " + e.message)); return; }
+      const url = "wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1"
+        + "?TrustedClientToken=" + TRUSTED
+        + "&ConnectionId=" + uuid().replace(/-/g, "")
+        + "&Sec-MS-GEC=" + gec
+        + "&Sec-MS-GEC-Version=" + GEC_VER;
+      const ws = new WebSocket(url);
+      ws.binaryType = "arraybuffer";
+      const chunks = [];
+      let done = false;
+      const timer = setTimeout(() => {
+        if (!done) { done = true; try { ws.close(); } catch (e) {} reject(new Error("timeout 45s")); }
+      }, 45000);
+      ws.onopen = () => {
+        ws.send("X-Timestamp:" + dateStr() + "\r\n"
+          + "Content-Type:application/json; charset=utf-8\r\n"
+          + "Path:speech.config\r\n\r\n"
+          + "{\"context\":{\"synthesis\":{\"audio\":{\"metadataoptions\":"
+          + "{\"sentenceBoundaryEnabled\":\"true\",\"wordBoundaryEnabled\":\"false\"},"
+          + "\"outputFormat\":\"audio-24khz-48kbitrate-mono-mp3\"}}}}\r\n");
+        const ssml = "<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'>"
+          + "<voice name='" + voice + "'>"
+          + "<prosody pitch='+0Hz' rate='+0%' volume='+0%'>" + escXml(text) + "</prosody>"
+          + "</voice></speak>";
+        ws.send("X-RequestId:" + uuid().replace(/-/g, "") + "\r\n"
+          + "Content-Type:application/ssml+xml\r\n"
+          + "X-Timestamp:" + dateStr() + "Z\r\n"
+          + "Path:ssml\r\n\r\n" + ssml);
+      };
+      ws.onmessage = (ev) => {
+        if (done) return;
+        if (typeof ev.data === "string") {
+          if (ev.data.indexOf("Path:turn.end") !== -1) {
+            done = true; clearTimeout(timer);
+            const blob = new Blob(chunks, { type: "audio/mpeg" });
+            if (blob.size === 0) { reject(new Error("အသံမရဘူး (0 bytes)")); }
+            else blob.arrayBuffer().then(buf => resolve(buf)).catch(e => reject(e));
+            try { ws.close(); } catch (e) {}
+          }
+        } else {
+          const buf = ev.data;
+          if (buf.byteLength < 2) return;
+          const hlen = new DataView(buf).getUint16(0, false);
+          const headerStr = new TextDecoder().decode(new Uint8Array(buf, 2, hlen));
+          if (headerStr.indexOf("Path:audio") !== -1) {
+            const audio = buf.slice(2 + hlen);
+            if (audio.byteLength > 0) chunks.push(audio);
+          }
+        }
+      };
+      ws.onerror = () => {
+        if (!done) { done = true; clearTimeout(timer); reject(new Error("WebSocket error (Microsoft က ငြင်းတာ ဖြစ်နိုင်တယ်)")); }
+      };
+      ws.onclose = (e) => {
+        if (!done && chunks.length === 0) {
+          done = true; clearTimeout(timer);
+          reject(new Error("ချိတ်ဆက်မှု ပိတ်သွားတယ် (code=" + e.code + ")"));
+        }
+      };
+    });
+  }
+
+  async function runJob() {
+    const texts = args.texts || [];
+    const voice = args.voice || "my-MM-NilarNeural";
+    const conc = Math.max(1, Math.min(4, args.concurrency || 3));
+    const mp3s = {};
+    const errors = {};
+    let doneCount = 0;
+    setMsg("Browser ကနေ အသံထုတ်နေတယ်… 0/" + texts.length);
+    // simple concurrency pool
+    let next = 0;
+    async function worker() {
+      while (next < texts.length) {
+        const i = next++;
+        try {
+          const buf = await ttsOne(texts[i], voice);
+          mp3s[i] = bufToB64(buf);
+        } catch (e) {
+          errors[i] = e.message;
+        }
+        doneCount++;
+        setBar(doneCount / texts.length);
+        setMsg("Browser ကနေ အသံထုတ်နေတယ်… " + doneCount + "/" + texts.length);
+      }
+    }
+    const workers = [];
+    for (let w = 0; w < conc; w++) workers.push(worker());
+    await Promise.all(workers);
+    const okCount = Object.keys(mp3s).length;
+    if (okCount === 0) {
+      setErr("တစ်လိုင်းမှ အသံထုတ်မရဘူး — " + JSON.stringify(errors).slice(0, 300));
+      setMsg("⛔ Browser TTS မရဘူး");
+    } else {
+      setMsg("✅ " + okCount + "/" + texts.length + " လိုင်း ရပြီ — app ကို ပို့နေတယ်…");
+    }
+    send("streamlit:setComponentValue", { value: { job: args.job, mp3s: mp3s, errors: errors } });
+    setHeight();
+  }
+
+  window.addEventListener("message", (ev) => {
+    const d = ev.data;
+    if (!d || typeof d !== "object") return;
+    if (d.type === "streamlit:render") {
+      args = d.args || {};
+      setHeight();
+      if (args.job && args.job !== startedJob && (args.texts || []).length > 0) {
+        startedJob = args.job;
+        runJob().catch(e => {
+          setErr("Job error: " + e.message);
+          send("streamlit:setComponentValue", { value: { job: args.job, mp3s: {}, errors: { _job: e.message } } });
+        });
+      }
+    }
+  });
+
+  // signal ready
+  send("streamlit:componentReady", { apiVersion: 1 });
+  setHeight();
+})();
+</script>
+</body>
+</html>
