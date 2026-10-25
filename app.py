@@ -1990,7 +1990,7 @@ def _video_fps(path):
     return 30.0
 
 
-def render_recap_video(video_path, natural, total_duration, work_dir, out_mp4):
+def render_recap_video(video_path, natural, total_duration, work_dir, out_mp4, speedup=1.0):
     """Recap render: video piece တစ်ခုချင်းစီကို narration အရှည်နဲ့ကိုက်အောင် ချိန်.
 
     natural: tts_natural() ကရတာ [{'start','end','text','mp3','dur'}].
@@ -1998,6 +1998,9 @@ def render_recap_video(video_path, natural, total_duration, work_dir, out_mp4):
     နောက်ဆုံးအပိုင်းဆို video အဆုံး) — piece တစ်ခုလုံးရဲ့ အရှည် P_i ကို
     (dur_i + gap_i) အဖြစ် setpts နဲ့ ချိန်တယ်. Gap (အသံတိတ်) အပိုင်းတွေက
     သူ့အတိုင်းကျန်မယ်. Leading silence (ပထမအပိုင်းမစခင်) လည်း 1x အတိုင်း.
+
+    speedup: final speed factor folded into this single encode (avoids a
+    second full re-encode in speedup_video). Timeline is divided by speedup.
 
     Returns: (out_mp4, timeline=[{'start','end','text'}],
               report=[(seg_idx, factor, note)])
@@ -2022,9 +2025,11 @@ def render_recap_video(video_path, natural, total_duration, work_dir, out_mp4):
         pieces.append((sg["start"], b, sg["dur"] + gap))
 
     fparts, vlabels = [], []
+    _sp = speedup if speedup and speedup > 0 else 1.0
     for j, (a, b, target) in enumerate(pieces):
         p_dur = b - a
         factor = target / p_dur if p_dur > 0.05 else 1.0
+        factor = factor / _sp  # ⚡ speedup ကို ဒီ encode ထဲမှာတင် ပေါင်း
         factor = min(max(factor, 0.05), 20.0)  # setpts အရမ်းလွန်ကဲတာ ကာကွယ်
         fparts.append(
             f"[0:v]trim=start={a:.3f}:end={b:.3f},"
@@ -2062,18 +2067,21 @@ def render_recap_video(video_path, natural, total_duration, work_dir, out_mp4):
             if gap > 0.02:
                 fh.write(f"file '{gap_file(gap)}'\n")
 
-    run(["ffmpeg", "-y", "-v", "error", "-i", video_path,
-         "-f", "concat", "-safe", "0", "-i", lst,
-         "-filter_complex", fcomplex,
-         "-map", "[vout]", "-map", "1:a:0",
-         "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-         "-c:a", "aac", "-b:a", "128k",
-         "-movflags", "+faststart", "-shortest", out_mp4])
+    _ff_cmd = ["ffmpeg", "-y", "-v", "error", "-i", video_path,
+               "-f", "concat", "-safe", "0", "-i", lst,
+               "-filter_complex", fcomplex,
+               "-map", "[vout]", "-map", "1:a:0"]
+    if abs(_sp - 1.0) > 1e-6:
+        _ff_cmd += ["-af", f"atempo={_sp:.4f}"]  # audio လည်း speedup အတူ
+    _ff_cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                "-c:a", "aac", "-b:a", "128k",
+                "-movflags", "+faststart", "-shortest", out_mp4]
+    run(_ff_cmd)
 
-    # subtitle အတွက် timeline အသစ်
+    # subtitle အတွက် timeline အသစ် (speedup ပေါင်းပြီးသား)
     timeline, report, cum = [], [], 0.0
     if natural[0]["start"] > 0.05:
-        cum = natural[0]["start"]
+        cum = natural[0]["start"] / _sp
     for i, sg in enumerate(natural):
         b = _boundary(i)
         p_dur = b - sg["start"]
@@ -2085,8 +2093,9 @@ def render_recap_video(video_path, natural, total_duration, work_dir, out_mp4):
         elif factor > 2.0:
             note = "အရမ်းမြန်"
         report.append((i, factor, note))
-        timeline.append({"start": cum, "end": cum + sg["dur"], "text": sg["text"]})
-        cum += target
+        timeline.append({"start": cum, "end": cum + sg["dur"] / _sp,
+                         "text": sg["text"]})
+        cum += target / _sp
     return out_mp4, timeline, report
 
 
@@ -3044,6 +3053,15 @@ def main():
     st.markdown(_SPIDEY_CSS, unsafe_allow_html=True)
     _init_state(st)
     S = st.session_state
+    # 🌐 Browser TTS component (browser ကနေ edge-tts တိုက်ရိုက် — server IP
+    # block ကို ကျော်ဖို့, relay/Termux မလို). browser_tts/ dir မရှိရင် None.
+    try:
+        import streamlit.components.v1 as _comp
+        _bt_dir = os.path.join(APP_DIR, "browser_tts")
+        _browser_tts = (_comp.declare_component("browser_tts", _bt_dir)
+                        if os.path.isdir(_bt_dir) else None)
+    except Exception:
+        _browser_tts = None
 
     # ---------------------------------------------------------- sidebar
     with st.sidebar:
@@ -3835,6 +3853,15 @@ def main():
             with _bc5:
                 _go5 = st.button("🔊 အသံထုတ်ရန်", type="primary",
                                  use_container_width=True)
+            # 🌐 Browser TTS toggle (component ရှိမှ ပြ)
+            _bt_mode = False
+            if _browser_tts is not None:
+                _bt_mode = st.checkbox(
+                    "🌐 Browser ကနေ တိုက်ရိုက် အသံထုတ် (relay/Termux မလို)",
+                    value=bool(S.get("browser_tts_mode")),
+                    key="browser_tts_mode_cb",
+                    help="အသံကို မင်းဖုန်း browser ကနေ Microsoft ကို တိုက်ရိုက်တောင်းမယ် — "
+                         "server IP block နဲ့ မဆိုင်တော့ဘူး. Relay ရှိရင် relay က ပိုမြန်နိုင်တယ်.")
 
             with st.expander("📱 ဖုန်းနဲ့ အသံထုတ်မယ် (server TTS မရတဲ့အခါ)"):
                 st.caption("Microsoft က server ကို block ထားလို့ အသံထုတ်မရတဲ့အခါ — "
@@ -3896,9 +3923,51 @@ def main():
                             st.info(f"📥 MP3 {_n_ok}/{len(_premade)} ခု တွေ့တယ် — fit လုပ်နေတယ်…")
                             _run_step5_fit(premade=_premade)
 
+            # 🌐 Browser TTS — component render + ရလာဒ် ကိုင်တွယ်
+            _bt_job = S.get("browser_tts_job")
+            if _bt_mode and _browser_tts is not None and _bt_job:
+                _bt_texts = [(s.get("text") or "").strip() for s in S.final_segments]
+                _bt_val = _browser_tts(texts=_bt_texts, voice=voice, job=_bt_job,
+                                       concurrency=3, key=f"bt_{S.run_id}",
+                                       default=None)
+                if isinstance(_bt_val, dict) and _bt_val.get("job") == _bt_job:
+                    import base64 as _b64
+                    _bt_dir = os.path.join(WORK_DIR, S.run_id, "browser_tts")
+                    os.makedirs(_bt_dir, exist_ok=True)
+                    _bt_mp3s = _bt_val.get("mp3s") or {}
+                    _bt_pre = []
+                    for _i in range(len(S.final_segments)):
+                        _b = _bt_mp3s.get(str(_i), _bt_mp3s.get(_i))
+                        if _b:
+                            _bp = os.path.join(_bt_dir, f"{_i:03d}.mp3")
+                            try:
+                                with open(_bp, "wb") as _fh:
+                                    _fh.write(_b64.b64decode(_b))
+                                _bt_pre.append(_bp)
+                            except Exception:
+                                _bt_pre.append(None)
+                        else:
+                            _bt_pre.append(None)
+                    S["browser_tts_job"] = None
+                    _n_ok = sum(1 for p in _bt_pre if p)
+                    if _n_ok == 0:
+                        st.error("⛔ Browser TTS ကနေ အသံတစ်လိုင်းမှ မရဘူး — "
+                                 "relay/zip လမ်းနဲ့ စမ်းပါ.")
+                    else:
+                        st.info(f"🌐 Browser TTS: {_n_ok}/{len(_bt_pre)} လိုင်း ရပြီ — "
+                                "fit လုပ်နေတယ်…")
+                        _run_step5_fit(premade=_bt_pre)
+                else:
+                    st.caption("🌐 Browser ကနေ အသံထုတ်နေတယ် — tab ကို ဖွင့်ထားပါ, "
+                               "ပြီးရင် auto ဆက်မယ်.")
+
             # 🔊 TTS button handler — expander နောက် (relay widget values ရပြီး)
             if _go5:
-                _run_step5_fit()
+                if _bt_mode and _browser_tts is not None:
+                    S["browser_tts_job"] = f"{S.run_id}_{int(time.time())}"
+                    st.rerun()
+                else:
+                    _run_step5_fit()
 
         _spidey_card_close()
 
@@ -3963,10 +4032,13 @@ def main():
                                            "ကျော်သွားမယ်")
                             work_rc = os.path.join(WORK_DIR, S.run_id, "recap")
                             _tmp_out = os.path.join(work_rc, "recap_video.mp4")
+                            # ⚡ speedup ကို render ထဲမှာတင် ပေါင်း — ၂ ခါ re-encode မလုပ်တော့
                             _, S.recap_timeline, S.recap_report = render_recap_video(
-                                S.video_path, natural, S.duration, work_rc, _tmp_out)
+                                S.video_path, natural, S.duration, work_rc, _tmp_out,
+                                speedup=speedup)
                             _stage = _tmp_out
                             _subs = [dict(s) for s in S.recap_timeline]
+                            _spd_done = True
                             _extreme = [(i, f) for (i, f, _n) in (S.recap_report or [])
                                         if f < 0.5 or f > 2.0]
                             if _extreme:
@@ -3981,8 +4053,9 @@ def main():
                             S.recap_timeline, S.recap_report, S.out_subs = None, None, None
                             _stage = out
                             _subs = [dict(s) for s in S.final_segments]
-                        # ⚡ speed-up (download မချခင် — video+audio အတူ, sync မပျက်)
-                        if speedup > 1.0:
+                            _spd_done = False
+                        # ⚡ speed-up (recap မုဒ်မှာ render ထဲမှာတင် ပြီးသား — ထပ်မလုပ်)
+                        if speedup > 1.0 and not _spd_done:
                             _spd = os.path.join(WORK_DIR, S.run_id, "spedup.mp4")
                             speedup_video(_stage, speedup, _spd)
                             _stage = _spd
