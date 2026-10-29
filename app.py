@@ -275,6 +275,12 @@ TTS_CONCURRENT = False
 # UI (Step 5 expander) က URL/token ထည့်ရင် _sync_relay_config() က ဒါတွေကို set မယ်.
 _RELAY_URL = ""
 _RELAY_TOKEN = ""
+# Instabox TTS backup — Streamlit server IP က Microsoft block ခံထားရလို့,
+# server ကနေ တိုက်ရိုက်ခေါ်မရတဲ့အခါ ဒီ server ကို တဆင့်ခံခေါ်မယ်.
+# ဒီ server IP က clean ဖြစ်တာ 2026-10-30 မှာ စမ်းပြီးပြီ (Thiha/Nilar, /api/tts).
+# Public URL ဖြစ်တယ် (Render nova-tts လိုပဲ, 60 req/min/IP rate limit ရှိတယ်),
+# ဒါကြောင့် token မလိုဘူး. မရရင် local/relay ကို အရန်အနေနဲ့ ပြန်ခေါ်မယ်.
+INSTABOX_TTS_URL = "https://3000-agqyjs44apy36qgher7oszsx6y.instabox.tech"
 
 def _tts_use_concurrent():
     """relay (phone IP, clean) so 3-concurrent; mahout yin TTS_CONCURRENT."""
@@ -1269,15 +1275,54 @@ def _set_relay_globals(url, token):
     _RELAY_TOKEN = (token or "").strip()
 
 
+async def _instabox_save(text, voice, path, base_url):
+    """Instabox backup server → MP3 (atomic write). POST /api/tts, JSON.
+    requests ကို သုံးတယ် (aiohttp ထက် proxy/CA မှာ ပိုစိတ်ချရလို့, app မှာလည်း
+    requests ကို တခြားနေရာတွေမှာ သုံးနေပြီးသား).
+    """
+    url = base_url.rstrip("/") + "/api/tts"
+
+    def _post():
+        import requests
+        r = requests.post(url, json={"text": text, "voice": voice}, timeout=90)
+        if r.status_code != 200:
+            raise RuntimeError(f"instabox HTTP {r.status_code}")
+        return r.content
+
+    try:
+        data = await asyncio.to_thread(_post)
+    except Exception as e:
+        raise RuntimeError(f"instabox fail: {type(e).__name__}: {e}")
+    if len(data) < 1000:
+        raise RuntimeError("instabox empty audio")
+    tmp = path + ".part"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
 async def _edge_save(text, voice, path):
     """edge-tts → tmp .part မှာ ရေး → size စစ် → ပြီးမှ cache path ကို replace.
 
     ကြားဖြတ်ပျက်ရင် ဖိုင်တစ်ဝက် cache ပေါ် မကျန်ဘူး (atomic write) —
     အရင်က တစ်ဝက်ဖိုင်ကို 1KB ကျော်ရင် "အကောင်း" အဖြစ် ထာဝရမှတ်မိတာ.
     📱 phone relay set ထားရင် relay ကို သုံး (Microsoft block ကျော်).
+    relay မရှိရင် Instabox backup ကို အရင်ခေါ်, မရမှ local edge-tts ကို ခေါ်.
     """
     if _RELAY_URL:
         return await _relay_save(text, voice, path, _RELAY_URL, _RELAY_TOKEN)
+    if INSTABOX_TTS_URL:
+        try:
+            return await _instabox_save(text, voice, path, INSTABOX_TTS_URL)
+        except Exception:
+            pass  # backup မရရင် အောက်က local edge-tts ကို အရန်အနေနဲ့ ဆက်ခေါ်
     import edge_tts
     tmp = path + ".part"
     try:
